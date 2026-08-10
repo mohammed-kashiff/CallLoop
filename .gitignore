@@ -1,0 +1,19 @@
+# secrets & environment
+.env
+.venv/
+
+# python
+__pycache__/
+*.pyc
+
+# data & audio (regenerated locally / recordings are sensitive)
+callproof.db
+audio/
+
+# node / frontend build
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# macOS
+.DS_Store

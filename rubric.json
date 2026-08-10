@@ -1,0 +1,51 @@
+{
+  "rubric_id": "professional_service_call_v1",
+  "name": "Professional Service Call",
+  "criteria": [
+    {
+      "id": "opening_purpose",
+      "name": "Opening & Purpose",
+      "method": "deterministic",
+      "weight": 15,
+      "check": "has_opening_purpose"
+    },
+    {
+      "id": "active_listening",
+      "name": "Active Listening & Understanding",
+      "method": "llm",
+      "weight": 20,
+      "question": "Did the AGENT acknowledge, paraphrase, or confirm the customer's need or concern before responding, rather than talking past them? Judge only the agent.",
+      "evidence_required": true
+    },
+    {
+      "id": "clarity",
+      "name": "Clarity of Communication",
+      "method": "llm",
+      "weight": 15,
+      "question": "Were the AGENT's explanations clear, specific, and free of confusing jargon? Cite the clearest agent line, or if communication was poor, the most confusing one.",
+      "evidence_required": true
+    },
+    {
+      "id": "empathy_tone",
+      "name": "Empathy & Professional Tone",
+      "method": "llm",
+      "weight": 20,
+      "question": "Was the AGENT courteous, patient, and empathetic throughout the call? Cite a representative agent line.",
+      "evidence_required": true
+    },
+    {
+      "id": "commitment_next_steps",
+      "name": "Commitment & Next Steps",
+      "method": "deterministic",
+      "weight": 20,
+      "check": "has_future_commitment"
+    },
+    {
+      "id": "professional_close",
+      "name": "Professional Close",
+      "method": "deterministic",
+      "weight": 10,
+      "check": "has_professional_close"
+    }
+  ]
+}
