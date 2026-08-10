@@ -1,26 +1,25 @@
 """
-CallProof - QA Engine (Milestones 3 + 4).
+CallProof - QA Engine (v3-capable).
 
-Loads a transcript from SQLite, runs each rubric criterion, produces a
-per-criterion verdict with VERIFIED evidence, then scores the call.
+Runs a config-driven rubric against a transcript and scores it deterministically.
 
-Criterion types:
-  - deterministic: plain Python rules (rules.py) - fast, free, reproducible
-  - llm: Claude Sonnet 5 judges the line AND must cite an exact transcript quote
+Criterion methods:
+  - deterministic         : a Python rule in rules.py
+  - llm                   : Claude judges, must cite an exact transcript quote
+  - deterministic_plus_llm: run both; either layer flagging "fail" => fail (gate-style)
+  - llm_plus_outcome_data : run the llm part now; outcome reconciliation is a
+                            separate delayed batch job (not done here)
 
-Evidence-validation gate: every quote the LLM cites is checked against the
-actual transcript. A finding whose quote is not really in the call is REJECTED
-(verdict -> "unverified"), so the model cannot invent evidence.
+Verdicts: pass / partial / fail / unverified / not_applicable / error.
+  - unverified   : the LLM cited a quote that isn't in the transcript (evidence gate)
+  - not_applicable: the criterion didn't apply (excluded from the score, not zeroed)
+  - error        : couldn't evaluate (excluded from the score)
 
-Scoring is deterministic: each verdict earns a fraction of its criterion weight
-(pass=1.0, partial=0.5, fail/unverified=0.0). A criterion that could not be
-evaluated (error) is EXCLUDED from the total, so a technical glitch never
-distorts the agent's score. The LLM never computes the score.
-
-Usage:
-  python qa_engine.py                 # analyze the most recent call
-  python qa_engine.py 2               # analyze call id 2
-  python qa_engine.py 2 speaker_0     # ...and treat speaker_0 as the agent
+Scoring is deterministic: pass=1.0, partial=0.5, fail=0.0 of the criterion weight.
+not_applicable / error / gates (weight 0) are excluded from BOTH numerator and
+denominator, so the weighted score renormalises. Gates never affect the weighted
+score; a gate that fails is surfaced as a flag (see score_results -> gate_fails).
+The LLM never computes the score.
 """
 
 import os
@@ -40,8 +39,8 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 DB_PATH = "callproof.db"
 RUBRIC_PATH = "rubric.json"
 MODEL = "claude-sonnet-5"
-MAX_HTTP_RETRIES = 2    # capped network retries
-MAX_PARSE_RETRIES = 2   # capped re-asks if the model output isn't valid JSON
+MAX_HTTP_RETRIES = 2
+MAX_PARSE_RETRIES = 2
 MAX_TOKENS = 600
 
 
@@ -67,7 +66,6 @@ def load_call(call_id=None):
 
 
 def identify_agent(segments):
-    """Heuristic: the agent is whoever speaks first (agents usually open a call)."""
     return segments[0]["speaker"] if segments else None
 
 
@@ -86,8 +84,6 @@ def _norm(text):
 
 
 def validate_evidence(quote, segments):
-    """A quote is VERIFIED only if it actually appears in the transcript
-    (normalized substring match). Returns (verified: bool, seq: int | None)."""
     q = _norm(quote)
     if not q:
         return False, None
@@ -99,7 +95,6 @@ def validate_evidence(quote, segments):
 
 # ---------- JSON parsing (robust) ----------
 def _iter_json_objects(text):
-    """Yield each complete, balanced {...} object in text (quote/escape aware)."""
     t = text or ""
     depth = 0
     start = None
@@ -129,7 +124,6 @@ def _iter_json_objects(text):
 
 
 def parse_json(text):
-    """Return the first parseable JSON object found anywhere in the text."""
     for obj in _iter_json_objects((text or "").strip()):
         try:
             return json.loads(obj)
@@ -141,28 +135,46 @@ def parse_json(text):
 # ---------- LLM criterion ----------
 SYSTEM_INSTRUCTIONS = (
     "You are a strict call-quality auditor. Evaluate ONLY the AGENT on the one "
-    "criterion given, using only the transcript provided. You MUST cite a real, "
-    "exact quote copied verbatim from a transcript line. Never invent or "
-    "paraphrase a quote. Respond with JSON only, no other text."
+    "criterion given, using only the transcript provided. When your verdict is "
+    "pass/partial/fail you MUST cite a real, exact quote copied verbatim from a "
+    "transcript line. Never invent or paraphrase a quote. Respond with JSON only."
 )
 
 
-def build_prompt(question, transcript_text, strict=False):
+def _criterion_question(cr):
+    """v3 criteria carry the LLM prompt in one of several fields."""
+    if cr.get("question"):
+        return cr["question"]
+    steps = [cr.get("question_step_1"), cr.get("question_step_2")]
+    steps = [s for s in steps if s]
+    if steps:
+        return "\n".join(f"Step {i}: {s}" for i, s in enumerate(steps, 1))
+    if cr.get("llm_question"):
+        return cr["llm_question"]
+    return None
+
+
+def build_prompt(question, transcript_text, allowed_verdicts, strict=False):
+    verdicts = " | ".join(f'"{v}"' for v in allowed_verdicts)
+    na_note = ""
+    if "not_applicable" in allowed_verdicts:
+        na_note = ('\nIf this criterion does not apply to this call, return '
+                   '"not_applicable" with a brief reason and an empty evidence_quote.')
     base = (
         f"{SYSTEM_INSTRUCTIONS}\n\n"
         f"CRITERION:\n{question}\n\n"
         f"TRANSCRIPT (one turn per line):\n{transcript_text}\n\n"
-        "Return ONLY this JSON object and nothing else:\n"
+        f"Your verdict MUST be one of: {verdicts}.{na_note}\n"
+        "Return ONLY this JSON object:\n"
         "{\n"
-        '  "verdict": "pass" | "partial" | "fail",\n'
+        f'  "verdict": one of {verdicts},\n'
         '  "reasoning": "one or two sentences",\n'
         '  "evidence_quote": "a SHORT exact span, 5-15 words, copied verbatim from one transcript line",\n'
         '  "evidence_seq": <the seq number of the line you quoted>\n'
         "}"
     )
     if strict:
-        base += ("\n\nYour previous reply could not be parsed. Output ONLY the raw JSON object: "
-                 "no markdown, no code fences, no commentary. Keep evidence_quote to at most 15 words.")
+        base += "\n\nYour previous reply could not be parsed. Output ONLY raw JSON, no markdown, no commentary."
     return base
 
 
@@ -172,16 +184,11 @@ def call_claude(prompt):
         try:
             resp = httpx.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": MODEL,
-                    "max_tokens": MAX_TOKENS,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
+                headers={"x-api-key": ANTHROPIC_API_KEY,
+                         "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": MODEL, "max_tokens": MAX_TOKENS,
+                      "messages": [{"role": "user", "content": prompt}]},
                 timeout=60,
             )
             if resp.status_code != 200:
@@ -195,9 +202,15 @@ def call_claude(prompt):
 
 
 def run_llm_criterion(criterion, transcript_text, segments):
+    question = _criterion_question(criterion)
+    if not question:
+        return {"verdict": "error", "reasoning": "No LLM question defined for this criterion.",
+                "evidence_text": None, "evidence_seq": None, "evidence_verified": False}
+    allowed = criterion.get("verdict_space", ["pass", "partial", "fail"])
+
     parsed = None
     for attempt in range(MAX_PARSE_RETRIES):
-        raw = call_claude(build_prompt(criterion["question"], transcript_text, strict=(attempt > 0)))
+        raw = call_claude(build_prompt(question, transcript_text, allowed, strict=(attempt > 0)))
         try:
             parsed = parse_json(raw)
             break
@@ -206,9 +219,14 @@ def run_llm_criterion(criterion, transcript_text, segments):
     if parsed is None:
         return {"verdict": "error", "reasoning": "Model output was not valid JSON after a retry.",
                 "evidence_text": None, "evidence_seq": None, "evidence_verified": False}
+
+    verdict = parsed.get("verdict", "error")
+    if verdict == "not_applicable":
+        return {"verdict": "not_applicable", "reasoning": parsed.get("reasoning", ""),
+                "evidence_text": None, "evidence_seq": None, "evidence_verified": None}
+
     quote = parsed.get("evidence_quote", "")
     verified, seq = validate_evidence(quote, segments)
-    verdict = parsed.get("verdict", "error")
     if criterion.get("evidence_required", True) and not verified:
         return {"verdict": "unverified", "reasoning": parsed.get("reasoning", ""),
                 "evidence_text": quote, "evidence_seq": parsed.get("evidence_seq"),
@@ -229,14 +247,75 @@ def run_deterministic_criterion(criterion, segments, agent_speaker):
             "evidence_verified": r["evidence_text"] is not None}
 
 
+# ---------- Combined (deterministic + llm): either flags fail => fail ----------
+def run_combined_criterion(criterion, segments, agent_speaker, transcript_text):
+    det = run_deterministic_criterion(criterion, segments, agent_speaker)
+    llm_q = criterion.get("llm_question")
+    if not llm_q:                      # no LLM layer specified: deterministic decides
+        return det
+    llm_cr = dict(criterion)
+    llm_cr["question"] = llm_q
+    llm_cr["verdict_space"] = ["pass", "fail"]
+    llm = run_llm_criterion(llm_cr, transcript_text, segments)
+    if det["verdict"] == "fail":
+        return det
+    if llm["verdict"] == "fail":
+        return llm
+    return det                          # neither layer flagged a failure
+
+
+# ---------- Dispatch ----------
+def evaluate_criterion(criterion, segments, agent_speaker, transcript_text):
+    method = criterion.get("method")
+    if method == "deterministic":
+        return run_deterministic_criterion(criterion, segments, agent_speaker)
+    if method == "deterministic_plus_llm":
+        return run_combined_criterion(criterion, segments, agent_speaker, transcript_text)
+    return run_llm_criterion(criterion, transcript_text, segments)   # llm, llm_plus_outcome_data
+
+
 # ---------- Scoring (deterministic) ----------
-FRACTION = {"pass": 1.0, "partial": 0.5, "fail": 0.0, "unverified": 0.0, "error": 0.0}
+FRACTION = {"pass": 1.0, "partial": 0.5, "fail": 0.0, "unverified": 0.0}
+SCORE_EXCLUDED = {"not_applicable", "error"}   # excluded from numerator AND denominator
 
 
+def performance_band(score):
+    if score >= 90:
+        return "Excellent"
+    if score >= 75:
+        return "Good"
+    if score >= 60:
+        return "Needs improvement"
+    return "Poor"
 
+
+def awarded_points(criterion, verdict):
+    """Points this criterion contributes, or None if it's excluded from scoring."""
+    if criterion.get("is_gate") or criterion.get("weight", 0) == 0:
+        return None
+    if verdict in SCORE_EXCLUDED:
+        return None
+    return round(criterion["weight"] * FRACTION.get(verdict, 0.0), 1)
+
+
+def score_results(results):
+    rows, earned, possible, tally, gate_fails = [], 0.0, 0.0, {}, []
+    for cr, res in results:
+        v = res["verdict"]
+        tally[v] = tally.get(v, 0) + 1
+        if cr.get("is_gate") and v == "fail":
+            gate_fails.append(cr["name"])
+        pts = awarded_points(cr, v)
+        rows.append((cr, res, pts))
+        if pts is not None:
+            earned += pts
+            possible += cr["weight"]
+    score = round(earned / possible * 100, 1) if possible else 0.0
+    return rows, score, round(earned, 1), round(possible, 1), tally, gate_fails
+
+
+# ---------- Coaching ----------
 def generate_coaching(weak):
-    """One Claude call: turn the weak criteria (with their validated findings)
-    into specific, actionable tips. Advisory only - never affects the score."""
     lines = []
     for i, (c, res) in enumerate(weak, 1):
         ev = res.get("evidence_text") or "(no specific line)"
@@ -256,131 +335,53 @@ def generate_coaching(weak):
         return [{"criterion": c["name"], "tip": "(coaching temporarily unavailable)"} for c, _ in weak]
 
 
-def performance_band(score):
-    if score >= 90:
-        return "Excellent"
-    if score >= 75:
-        return "Good"
-    if score >= 60:
-        return "Needs improvement"
-    return "Poor"
-
-
-def score_results(results):
-    rows, earned, possible, tally = [], 0.0, 0.0, {}
-    for c, res in results:
-        v = res["verdict"]
-        tally[v] = tally.get(v, 0) + 1
-        if v == "error":                      # excluded from the total (fair)
-            rows.append((c, res, None))
-            continue
-        awarded = round(c["weight"] * FRACTION.get(v, 0.0), 1)
-        earned += awarded
-        possible += c["weight"]
-        rows.append((c, res, awarded))
-    score = round(earned / possible * 100, 1) if possible else 0.0
-    return rows, score, round(earned, 1), round(possible, 1), tally
-
-
 LABEL = {"pass": "PASS", "partial": "PARTIAL", "fail": "FAIL",
-         "unverified": "UNVERIFIED", "error": "ERROR"}
+         "unverified": "UNVERIFIED", "not_applicable": "N/A", "error": "ERROR"}
 
 
 def main():
     if not ANTHROPIC_API_KEY:
         sys.exit("ERROR: ANTHROPIC_API_KEY not found in .env")
-
-    arg_id = None
-    if len(sys.argv) > 1:
-        try:
-            arg_id = int(sys.argv[1])
-        except ValueError:
-            sys.exit("First argument must be a numeric call id, e.g. `python qa_engine.py 2`.")
+    arg_id = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else None
     agent_override = sys.argv[2] if len(sys.argv) > 2 else None
 
     call_id, meta, segments = load_call(arg_id)
     if not segments:
         sys.exit(f"Call {call_id} has no segments to analyze.")
-
     agent = agent_override or identify_agent(segments)
     transcript_text = format_transcript(segments, agent)
-
     with open(RUBRIC_PATH) as f:
         rubric = json.load(f)
 
-    print(f"CallProof QA - call id {call_id}  "
-          f"({meta.get('audio_seconds')}s, {len(segments)} turns)")
-    print(f"Rubric: {rubric['name']}   |   agent = {agent} "
-          f"({'override' if agent_override else 'first speaker; override with a 2nd arg'})")
+    print(f"CallProof QA - call id {call_id} ({meta.get('audio_seconds')}s, {len(segments)} turns)")
+    print(f"Rubric: {rubric['name']} | agent = {agent}")
     print("=" * 72)
 
     results = []
     for c in rubric["criteria"]:
-        if c["method"] == "deterministic":
-            res = run_deterministic_criterion(c, segments, agent)
-        else:
+        if c["method"] != "deterministic":
             print(f"  ...asking Claude: {c['name']}")
-            res = run_llm_criterion(c, transcript_text, segments)
-        results.append((c, res))
+        results.append((c, evaluate_criterion(c, segments, agent, transcript_text)))
 
-    # ----- Detailed findings -----
-    print("=" * 72)
-    for c, res in results:
-        tag = "rule" if c["method"] == "deterministic" else "llm "
-        print(f"\n[{tag}] {c['name']}  ->  {LABEL.get(res['verdict'], res['verdict'].upper())}"
-              f"   (weight {c['weight']})")
-        print(f"       {res['reasoning']}")
-        if res.get("evidence_text"):
-            if c["method"] == "llm":
-                mark = (f"VERIFIED - seq {res['evidence_seq']}" if res["evidence_verified"]
-                        else "REJECTED - quote not found in transcript")
-            else:
-                mark = (f"from seq {res['evidence_seq']}"
-                        if res["evidence_seq"] is not None else "-")
-            print(f'       evidence: "{res["evidence_text"]}"  [{mark}]')
-
-    # ----- Evidence-gate proof -----
-    print("\n" + "-" * 72)
-    fake = "i am so sorry let me refund your entire account right now"
-    ok, _ = validate_evidence(fake, segments)
-    print(f"Evidence-gate self-check - fabricated quote rejected: {'YES' if not ok else 'NO (!)'}")
-
-    # ----- Scorecard -----
-    rows, score, earned, possible, tally = score_results(results)
+    rows, score, earned, possible, tally, gate_fails = score_results(results)
     grade = performance_band(score)
-    print("\n" + "=" * 72)
-    print("SCORECARD")
-    print("-" * 72)
-    for c, res, awarded in rows:
-        name = c["name"]
-        dots = "." * max(3, 46 - len(name))
-        verdict = LABEL.get(res["verdict"], res["verdict"].upper())
-        pts = "  -  " if awarded is None else f"{awarded:>5}"
-        note = "   (not scored)" if awarded is None else ""
-        print(f"  {name} {dots} {verdict:<11} {pts} / {c['weight']}{note}")
-    tally_str = ", ".join(f"{n} {k}" for k, n in tally.items())
-    print("-" * 72)
-    print(f"  Verdicts: {tally_str}")
-    n_errors = tally.get("error", 0)
-    if n_errors:
-        scored = len(results) - n_errors
-        print(f"  Scored on {scored} of {len(results)} criteria "
-              f"({earned} of {possible} possible points); {n_errors} could not be evaluated.")
-    print(f"  TOTAL SCORE:  {score} / 100   ->   {grade.upper()}")
-    print("=" * 72)
 
-    # ----- Coaching -----
-    weak = [(c, res) for c, res in results if res["verdict"] in ("fail", "partial", "unverified")]
+    print("=" * 72)
+    for c, res, pts in rows:
+        gate = " [GATE]" if c.get("is_gate") else ""
+        pt = "  -  " if pts is None else f"{pts:>5}/{c['weight']}"
+        print(f"\n[{c['method']}]{gate} {c['name']} -> {LABEL.get(res['verdict'], res['verdict'].upper())}  {pt}")
+        print(f"     {res['reasoning']}")
+        if res.get("evidence_text"):
+            mk = "VERIFIED" if res.get("evidence_verified") else "REJECTED"
+            print(f'     evidence: "{res["evidence_text"]}"  [{mk}]')
+
     print("\n" + "=" * 72)
-    print("COACHING")
-    print("-" * 72)
-    if not weak:
-        print("  Strong call - every criterion earned full marks. Nothing to coach.")
-    else:
-        print(f"  ...generating tips for {len(weak)} area(s)")
-        for item in generate_coaching(weak):
-            print(f"\n  {item.get('criterion','')}:")
-            print(f"      {item.get('tip','')}")
+    if gate_fails:
+        print(f"!! GATE FAILURE - flag for manager review: {', '.join(gate_fails)}")
+    tally_str = ", ".join(f"{n} {k}" for k, n in tally.items())
+    print(f"Verdicts: {tally_str}")
+    print(f"TOTAL SCORE: {score} / 100 ({earned} of {possible} weighted points)  ->  {grade.upper()}")
     print("=" * 72)
 
 
