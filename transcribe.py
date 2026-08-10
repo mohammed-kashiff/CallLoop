@@ -1,42 +1,42 @@
 """
-CallProof - transcript spine (now supports local files).
-Submit an audio recording to PyAI Hear (async job), poll until done, and save a
-speaker-labeled, timestamped transcript into SQLite. Works with a local file
-(uploaded directly, no hosting needed) or a public https URL. Transcribes each
-source once: re-runs load from the DB instead of calling the API again
-(protects the daily unit cap).
+CallProof - transcript spine (with logging).
+
+Submit a local audio file (or public URL) to PyAI Hear, poll until done, and
+save a speaker-labelled, timestamped transcript to SQLite. Each source is
+transcribed once (cached by content hash). On a failed job, PyAI's actual error
+is logged and raised - no more silent failures.
 """
 
 import os
 import sys
 import time
 import json
+import logging
 import sqlite3
 import hashlib
 
 import httpx
 from dotenv import load_dotenv
 
-# ---------- Config ----------
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("callproof.transcribe")
 
 PYAI_API_KEY = os.getenv("PYAI_API_KEY")
 BASE_URL = "https://api.pyai.com"
 DB_PATH = "callproof.db"
 
-# What to transcribe: a local file path OR a public https URL.
-AUDIO_SOURCE = "/Users/mohammed.kashif/Downloads/test1.mp3"
-
-# Speaker separation:
-#   "diarize" - model-based; works on mono OR stereo. Safe default for any file.
-#   "channel" - exact per-side split; ONLY for true dual-channel stereo calls.
-SEPARATION_MODE = "diarize"
-
+AUDIO_SOURCE = "/Users/mohammed.kashif/Downloads/test1.mp3"   # only used by the CLI main()
+SEPARATION_MODE = "diarize"    # "diarize" (mono or stereo) | "channel" (true dual-channel)
 MODEL = "pyai-hear-telephony"
 
-# Polling - capped so a stuck job can't loop forever or burn units.
 POLL_INTERVAL_SECONDS = 2
-POLL_MAX_ATTEMPTS = 60  # 60 * 2s = 120s ceiling (room for a longer file)
+POLL_MAX_ATTEMPTS = 60
 
 if not PYAI_API_KEY:
     sys.exit("ERROR: PYAI_API_KEY not found. Is .env in this folder?")
@@ -48,28 +48,23 @@ def is_url(src):
     return src.startswith("http://") or src.startswith("https://")
 
 
-# ---------- Database (same schema; call id 1 stays intact) ----------
+# ---------- Database ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""CREATE TABLE IF NOT EXISTS calls (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        audio_url TEXT UNIQUE NOT NULL,
-        job_id TEXT, status TEXT, full_text TEXT,
-        speakers INTEGER, audio_seconds REAL, raw_json TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        id INTEGER PRIMARY KEY AUTOINCREMENT, audio_url TEXT UNIQUE NOT NULL,
+        job_id TEXT, status TEXT, full_text TEXT, speakers INTEGER,
+        audio_seconds REAL, raw_json TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS segments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        call_id INTEGER NOT NULL REFERENCES calls(id),
-        seq INTEGER, speaker TEXT, channel INTEGER,
-        start REAL, end REAL, text TEXT)""")
+        id INTEGER PRIMARY KEY AUTOINCREMENT, call_id INTEGER NOT NULL,
+        seq INTEGER, speaker TEXT, channel INTEGER, start REAL, end REAL, text TEXT)""")
     conn.commit()
     return conn
 
 
 def find_existing_call(conn, identity):
     return conn.execute(
-        "SELECT id FROM calls WHERE audio_url = ? AND status = 'completed'",
-        (identity,)).fetchone()
+        "SELECT id FROM calls WHERE audio_url = ? AND status = 'completed'", (identity,)).fetchone()
 
 
 def save_transcript(conn, identity, job_id, result):
@@ -87,28 +82,27 @@ def save_transcript(conn, identity, job_id, result):
             (call_id, i, seg.get("speaker"), seg.get("channel"),
              seg.get("start"), seg.get("end"), seg.get("text")))
     conn.commit()
+    log.info("saved transcript for call %d (%d segments)", call_id, len(segments))
     return call_id
 
 
 # ---------- PyAI service wrapper ----------
 def submit_job_url(audio_url):
-    body = {"audio_url": audio_url, "model": MODEL,
-            "numerals": True, "output_formats": ["json"]}
+    body = {"audio_url": audio_url, "model": MODEL, "numerals": True, "output_formats": ["json"]}
     body.update({"channel": True} if SEPARATION_MODE == "channel" else {"diarize": True})
     idem = hashlib.sha256(audio_url.encode()).hexdigest()[:32]
-    headers = {**HEADERS, "Idempotency-Key": idem}
-    resp = httpx.post(f"{BASE_URL}/v1/transcription/jobs", json=body, headers=headers, timeout=60)
+    resp = httpx.post(f"{BASE_URL}/v1/transcription/jobs", json=body,
+                      headers={**HEADERS, "Idempotency-Key": idem}, timeout=60)
     return _job_id_from(resp)
 
 
 def submit_job_file(path):
     with open(path, "rb") as f:
         audio_bytes = f.read()
-    filename = os.path.basename(path)
-    files = {"audio": (filename, audio_bytes, "application/octet-stream")}
+    files = {"audio": (os.path.basename(path), audio_bytes, "application/octet-stream")}
     data = {"model": MODEL, "numerals": "true", "output_formats": "json"}
     data.update({"channel": "true"} if SEPARATION_MODE == "channel" else {"diarize": "true"})
-    print(f"  uploading {len(audio_bytes) / 1_000_000:.2f} MB ...")
+    log.info("submitting %.2f MB to PyAI Hear (%s mode)", len(audio_bytes) / 1_000_000, SEPARATION_MODE)
     resp = httpx.post(f"{BASE_URL}/v1/transcription/jobs",
                       files=files, data=data, headers=HEADERS, timeout=120)
     return _job_id_from(resp)
@@ -116,27 +110,36 @@ def submit_job_file(path):
 
 def _job_id_from(resp):
     if resp.status_code not in (200, 202):
-        sys.exit(f"ERROR submitting job: {resp.status_code} {resp.text}")
+        log.error("job submission rejected: %s %s", resp.status_code, resp.text[:300])
+        raise RuntimeError(f"PyAI rejected the job: {resp.status_code} {resp.text}")
     job_id = resp.json().get("job_id")
     if not job_id:
-        sys.exit(f"ERROR: no job_id in response: {resp.text}")
+        raise RuntimeError(f"No job_id in PyAI response: {resp.text}")
+    log.info("job submitted: %s", job_id)
     return job_id
 
 
 def poll_job(job_id):
+    last_status = None
     for attempt in range(1, POLL_MAX_ATTEMPTS + 1):
         resp = httpx.get(f"{BASE_URL}/v1/transcription/jobs/{job_id}", headers=HEADERS, timeout=30)
         if resp.status_code != 200:
-            sys.exit(f"ERROR polling job: {resp.status_code} {resp.text}")
+            log.error("poll error: %s %s", resp.status_code, resp.text[:300])
+            raise RuntimeError(f"PyAI poll error: {resp.status_code} {resp.text}")
         data = resp.json()
         status = data.get("status")
-        print(f"  attempt {attempt}/{POLL_MAX_ATTEMPTS}: status = {status}")
+        if status != last_status:
+            log.info("job %s status: %s (attempt %d)", job_id, status, attempt)
+            last_status = status
         if status == "completed":
             return get_result(data)
         if status in ("failed", "cancelled"):
-            sys.exit(f"ERROR: job {status}: {data.get('error')}")
+            reason = data.get("error") or data
+            log.error("job %s %s: %s", job_id, status, reason)
+            raise RuntimeError(f"PyAI job {status}: {reason}")
         time.sleep(POLL_INTERVAL_SECONDS)
-    sys.exit(f"ERROR: job didn't finish within {POLL_MAX_ATTEMPTS * POLL_INTERVAL_SECONDS}s.")
+    raise RuntimeError(f"PyAI job {job_id} did not finish within "
+                       f"{POLL_MAX_ATTEMPTS * POLL_INTERVAL_SECONDS}s")
 
 
 def get_result(job_data):
@@ -146,10 +149,10 @@ def get_result(job_data):
         r = httpx.get(job_data["result_url"], timeout=30)
         r.raise_for_status()
         return r.json()
-    sys.exit(f"ERROR: completed job has no result or result_url: {job_data}")
+    raise RuntimeError(f"Completed job has no result or result_url: {job_data}")
 
 
-# ---------- Orchestrator ----------
+# ---------- Orchestrator (CLI) ----------
 def identity_for(src):
     if is_url(src):
         return src
@@ -157,43 +160,20 @@ def identity_for(src):
         return "file-sha256:" + hashlib.sha256(f.read()).hexdigest()[:24]
 
 
-def print_transcript(conn, call_id):
-    full_text, speakers, audio_seconds = conn.execute(
-        "SELECT full_text, speakers, audio_seconds FROM calls WHERE id = ?", (call_id,)).fetchone()
-    segs = conn.execute(
-        "SELECT speaker, channel, start, end, text FROM segments WHERE call_id = ? ORDER BY seq",
-        (call_id,)).fetchall()
-    print(f"Speakers: {speakers}   Audio: {audio_seconds}s   Segments: {len(segs)}")
-    print("-" * 64)
-    if segs:
-        for speaker, channel, start, end, text in segs:
-            ts = f"[{start:7.2f}-{end:7.2f}]" if start is not None else "[    --    ]"
-            print(f"{ts} {(speaker or '?'):>10}: {text}")
-    else:
-        print("(No per-segment data - full transcript:)")
-        print(full_text)
-
-
 def main():
     src = AUDIO_SOURCE
     conn = init_db()
     if not is_url(src) and not os.path.isfile(src):
-        sys.exit(f"ERROR: file not found: {src}\nCheck the path and filename.")
-
+        sys.exit(f"ERROR: file not found: {src}")
     identity = identity_for(src)
     existing = find_existing_call(conn, identity)
     if existing:
-        print(f"Already transcribed (call id {existing[0]}). Loading from DB - no API call.\n")
-        print_transcript(conn, existing[0])
+        log.info("already transcribed (call id %d) - loading from DB, no API call", existing[0])
         return
-
-    print(f"Transcribing ({SEPARATION_MODE} mode):\n  {src}")
     job_id = submit_job_url(src) if is_url(src) else submit_job_file(src)
-    print(f"Job submitted: {job_id}\nPolling...")
     result = poll_job(job_id)
     call_id = save_transcript(conn, identity, job_id, result)
-    print(f"\nSaved to {DB_PATH} (call id {call_id}).\n")
-    print_transcript(conn, call_id)
+    log.info("done: call id %d", call_id)
 
 
 if __name__ == "__main__":

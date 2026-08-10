@@ -1,19 +1,15 @@
 """
-CallProof - FastAPI backend (v3-capable).
+CallProof - FastAPI backend (v3, with logging).
 
-Exposes the audit as JSON, serves call audio, and accepts drag-and-drop uploads.
-Reuses qa_engine.py (analysis) and transcribe.py (transcription).
-
-The audit is cached in SQLite, keyed to a hash of rubric.json, so editing the
-rubric (e.g. in Cursor) auto-invalidates stale audits.
-
-Run from ~/callproof (venv active):
-  uvicorn api:app --reload --port 8000
+Every request logs what it does. Crucially, /audit logs whether it served from
+CACHE (stable score) or recomputed (MISS) - so you can see, per request, why a
+score is or isn't changing.
 """
 
 import os
 import json
 import hashlib
+import logging
 import sqlite3
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
@@ -22,6 +18,13 @@ from fastapi.responses import FileResponse
 
 import qa_engine as qa
 import transcribe
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("callproof.api")
 
 DB_PATH = qa.DB_PATH
 AUDIO_DIR = "audio"
@@ -52,6 +55,7 @@ def _startup():
         if "rubric_hash" not in cols:
             c.execute("ALTER TABLE audits ADD COLUMN rubric_hash TEXT")
     os.makedirs(AUDIO_DIR, exist_ok=True)
+    log.info("startup complete; db=%s", DB_PATH)
 
 
 _startup()
@@ -78,6 +82,7 @@ def analyze_call(call_id, agent_override=None):
     with open(qa.RUBRIC_PATH) as f:
         rubric = json.load(f)
 
+    log.info("computing audit for call %d (%d criteria)", call_id, len(rubric["criteria"]))
     results = [(cr, qa.evaluate_criterion(cr, segments, agent, transcript_text))
                for cr in rubric["criteria"]]
 
@@ -121,11 +126,15 @@ def get_audit(call_id: int, refresh: bool = False):
             row = c.execute(
                 "SELECT audit_json, rubric_hash FROM audits WHERE call_id=?", (call_id,)).fetchone()
         if row and row["rubric_hash"] == rh:
-            return json.loads(row["audit_json"])
+            cached = json.loads(row["audit_json"])
+            log.info("cache HIT  call %d (score %s) - returning stored audit", call_id, cached.get("score"))
+            return cached
+    log.info("cache %s call %d - computing fresh audit", "BYPASS (refresh)" if refresh else "MISS ", call_id)
     audit = analyze_call(call_id)
     with _conn() as c:
         c.execute("INSERT OR REPLACE INTO audits (call_id, audit_json, rubric_hash) VALUES (?, ?, ?)",
                   (call_id, json.dumps(audit), rh))
+    log.info("cached audit for call %d (score %s)", call_id, audit["score"])
     return audit
 
 
@@ -140,10 +149,10 @@ def get_audio(call_id: int):
 
 @app.post("/api/upload")
 def upload(file: UploadFile = File(...)):
-    """Accept a dropped audio file, transcribe it, store it, return the new call id."""
     data = file.file.read()
     if not data:
         raise HTTPException(status_code=400, detail="The uploaded file was empty.")
+    log.info("upload received: %s (%.2f MB)", file.filename, len(data) / 1_000_000)
 
     os.makedirs(AUDIO_DIR, exist_ok=True)
     tmp = os.path.join(AUDIO_DIR, "_upload_tmp")
@@ -156,16 +165,19 @@ def upload(file: UploadFile = File(...)):
         existing = transcribe.find_existing_call(conn, identity)
         if existing:
             call_id = existing[0]
+            log.info("upload deduped to existing call %d (no re-transcription)", call_id)
         else:
             job_id = transcribe.submit_job_file(tmp)
             result = transcribe.poll_job(job_id)
             call_id = transcribe.save_transcript(conn, identity, job_id, result)
+            log.info("transcription complete -> new call %d", call_id)
         conn.close()
         os.replace(tmp, os.path.join(AUDIO_DIR, f"{call_id}.mp3"))
     except HTTPException:
         raise
-    except (Exception, SystemExit) as e:   # transcribe.py uses sys.exit on API errors
+    except (Exception, SystemExit) as e:
         msg = str(e)
+        log.error("upload/transcription failed: %s", msg)
         if "daily_cap_exceeded" in msg:
             raise HTTPException(status_code=429,
                 detail="Daily transcription cap reached (resets 00:00 UTC). Try a fresh key or later.")
