@@ -411,7 +411,7 @@ def extract_feedback(transcript_text, segments):
         parsed = parse_json(call_claude(prompt))
     except Exception as e:  # noqa: BLE001
         log.error("feedback extraction failed: %s", e)
-        return {"agent": [], "product": []}
+        return {"status": "error", "error": str(e), "agent": [], "product": []}
     out = {}
     for bucket in ("agent", "product"):
         items = []
@@ -425,6 +425,7 @@ def extract_feedback(transcript_text, segments):
                           "verified": verified if quote else None})
         out[bucket] = items
     log.info("feedback extracted: %d agent, %d product", len(out["agent"]), len(out["product"]))
+    out["status"] = "ok"
     return out
 
 
