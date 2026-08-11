@@ -475,7 +475,7 @@ def main():
     call_id, meta, segments = load_call(arg_id)
     if not segments:
         sys.exit(f"Call {call_id} has no segments to analyze.")
-    agent = agent_override or identify_agent(segments)
+    agent = agent_override or classify_roles(segments)
     transcript_text = format_transcript(segments, agent)
     with open(RUBRIC_PATH) as f:
         rubric = json.load(f)
