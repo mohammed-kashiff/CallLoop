@@ -32,6 +32,7 @@ export default function App() {
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState(null);
   const [dragOver, setDragOver] = useState(false);
+  const [emailQueued, setEmailQueued] = useState(false);
   const audioRef = useRef(null);
   const fileInputRef = useRef(null);
 
@@ -57,6 +58,7 @@ export default function App() {
   function loadAudit(id, refresh = false) {
     setLoading(true);
     setError(null);
+    setEmailQueued(false);
     if (!refresh) setAudit(null);
     fetch(`${API}/api/calls/${id}/audit${refresh ? "?refresh=true" : ""}`)
       .then((r) => {
@@ -111,6 +113,10 @@ export default function App() {
     a.play();
   }
 
+  const churn = audit && audit.churn;
+  const showChurn = churn && ["low", "medium", "high"].includes(churn.risk);
+  const churnSeg = churn && churn.evidence_seq != null ? segBySeq[churn.evidence_seq] : null;
+
   return (
     <div className="app">
       <header className="topbar">
@@ -161,6 +167,38 @@ export default function App() {
       {error && <div className="banner error">{error}</div>}
       {loading && (
         <div className="banner">Auditing the call… (the first run calls the model)</div>
+      )}
+
+      {showChurn && (
+        <div className={`churn churn-${churn.risk}`}>
+          <div className="churn-head">
+            <span className="churn-title">
+              ⚠ Churn Risk: <b>{churn.risk.toUpperCase()}</b>
+            </span>
+            {(churn.risk === "high" || churn.risk === "medium") &&
+              (emailQueued ? (
+                <span className="churn-queued">
+                  ✓ Stakeholder alert queued (email delivery not yet configured)
+                </span>
+              ) : (
+                <button className="churn-email" onClick={() => setEmailQueued(true)}>
+                  ✉ Send Email to Stakeholder
+                </button>
+              ))}
+          </div>
+          <div className="churn-reason">{churn.reasoning}</div>
+          {churn.evidence_text && (
+            <div className="churn-evidence">
+              <span>“{churn.evidence_text}”</span>
+              {churn.evidence_verified && <span className="verify ok">✓ verified</span>}
+              {churnSeg && (
+                <button className="jump" onClick={() => jumpTo(churnSeg.start)}>
+                  ▶ {fmtTime(churnSeg.start)}
+                </button>
+              )}
+            </div>
+          )}
+        </div>
       )}
 
       {audit && (

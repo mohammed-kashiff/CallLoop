@@ -366,6 +366,40 @@ def generate_coaching(weak):
     return [{"criterion": c["name"], "tip": "(coaching temporarily unavailable)"} for c, _ in weak]
 
 
+CHURN_LEVELS = ["none", "low", "medium", "high"]
+
+
+def assess_churn(transcript_text, segments):
+    """One LLM pass: rate churn risk and cite the customer's own words. Evidence-validated."""
+    prompt = (
+        "Analyze this customer service call for CHURN RISK - signs the customer may stop doing "
+        "business: cancelling, downgrading, switching to a competitor, strong dissatisfaction, "
+        "repeated unresolved issues, or threats to leave. Rate the risk and cite the customer's "
+        "exact words.\n\n"
+        f"TRANSCRIPT (one turn per line):\n{transcript_text}\n\n"
+        'Return ONLY this JSON:\n'
+        '{"risk": "none|low|medium|high", "reasoning": "one or two sentences", '
+        '"evidence_quote": "exact customer line showing risk, or empty if none", '
+        '"evidence_seq": <seq number or null>}'
+    )
+    try:
+        parsed = parse_json(call_claude(prompt))
+    except Exception as e:  # noqa: BLE001
+        log.error("churn assessment failed: %s", e)
+        return {"risk": "unknown", "reasoning": "Could not assess churn.",
+                "evidence_text": None, "evidence_seq": None, "evidence_verified": None}
+    risk = parsed.get("risk", "unknown")
+    if risk not in CHURN_LEVELS:
+        risk = "unknown"
+    quote = parsed.get("evidence_quote", "") or ""
+    verified, seq = validate_evidence(quote, segments) if quote else (False, None)
+    log.info("churn risk assessed: %s", risk)
+    return {"risk": risk, "reasoning": parsed.get("reasoning", ""),
+            "evidence_text": quote or None,
+            "evidence_seq": seq if verified else None,
+            "evidence_verified": verified if quote else None}
+
+
 LABEL = {"pass": "PASS", "partial": "PARTIAL", "fail": "FAIL",
          "unverified": "UNVERIFIED", "not_applicable": "N/A", "error": "ERROR"}
 

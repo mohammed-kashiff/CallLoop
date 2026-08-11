@@ -90,6 +90,7 @@ def analyze_call(call_id, agent_override=None):
     grade = qa.performance_band(score)
     weak = [(c, r) for c, r in results if r["verdict"] in ("fail", "partial", "unverified")]
     coaching = qa.generate_coaching(weak) if weak else []
+    churn = qa.assess_churn(transcript_text, segments)
 
     findings = [{
         "id": cr["id"], "name": cr["name"], "method": cr["method"], "weight": cr["weight"],
@@ -106,6 +107,7 @@ def analyze_call(call_id, agent_override=None):
         "score": score, "grade": grade, "tally": tally,
         "gate_fails": gate_fails, "flagged": bool(gate_fails),
         "segments": segments, "findings": findings, "coaching": coaching,
+        "churn": churn,
     }
 
 

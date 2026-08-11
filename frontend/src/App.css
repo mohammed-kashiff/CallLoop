@@ -113,3 +113,17 @@
 .dropzone:hover { border-color: #2f6fb0; color: #2f6fb0; }
 .dropzone.over { border-color: #2f6fb0; background: #eef5ff; color: #2f6fb0; }
 .dropzone.busy { cursor: progress; border-color: #c08a1e; background: #fdf7ea; color: #a97e18; }
+
+/* churn risk banner */
+.churn { border-radius: 14px; padding: 14px 18px; margin: 4px 0 10px; border: 1px solid; }
+.churn-low    { background: #eef5ff; border-color: #d3e2f5; color: #2f5788; }
+.churn-medium { background: #fdf3e0; border-color: #f0d191; color: #8a5a0f; }
+.churn-high   { background: #fdecea; border-color: #f3c0ba; color: #a3291e; }
+.churn-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.churn-title { font-size: 15px; font-weight: 700; }
+.churn-reason { margin-top: 6px; font-size: 14px; line-height: 1.5; }
+.churn-evidence { margin-top: 8px; display: flex; align-items: center; gap: 8px; font-style: italic; font-size: 13.5px; }
+.churn-email { background: #c0392b; color: #fff; border: none; border-radius: 9px;
+  padding: 8px 14px; font-weight: 700; font-size: 13px; cursor: pointer; }
+.churn-email:hover { background: #a3291e; }
+.churn-queued { font-size: 13px; font-weight: 700; }
