@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from "react";
 import "./App.css";
 
 const API = "http://localhost:8000";
+const MAX_UPLOAD_MB = 25;
+const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 const FRACTION = { pass: 1, partial: 0.5, fail: 0, unverified: 0, error: 0 };
 
 function fmtTime(s) {
@@ -77,15 +79,23 @@ export default function App() {
   async function handleFiles(files) {
     const f = files && files[0];
     if (!f) return;
-    setUploading(true);
     setUploadError(null);
+    if (f.size > MAX_UPLOAD_BYTES) {
+      const mb = (f.size / (1024 * 1024)).toFixed(1);
+      setUploadError(
+        `File too large for transcription (${mb} MB). Maximum is ${MAX_UPLOAD_MB} MB.`,
+      );
+      return;
+    }
+    setUploading(true);
     try {
       const fd = new FormData();
       fd.append("file", f);
       const r = await fetch(`${API}/api/upload`, { method: "POST", body: fd });
       if (!r.ok) {
         const d = await r.json().catch(() => ({}));
-        throw new Error(d.detail || "Upload failed");
+        const detail = typeof d.detail === "string" ? d.detail : "Upload failed";
+        throw new Error(detail);
       }
       const { call_id } = await r.json();
       await refreshCalls();
@@ -165,7 +175,9 @@ export default function App() {
         {uploading ? (
           <span>⏳ Transcribing your call… this can take 20–40 seconds</span>
         ) : (
-          <span>⬆ Drag a call recording here, or click to choose a file</span>
+          <span>
+            Drag a call recording here, or click to choose a file (max {MAX_UPLOAD_MB} MB)
+          </span>
         )}
       </div>
       {uploadError && <div className="banner error">{uploadError}</div>}

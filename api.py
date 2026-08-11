@@ -28,6 +28,8 @@ log = logging.getLogger("callproof.api")
 
 DB_PATH = qa.DB_PATH
 AUDIO_DIR = "audio"
+# PyAI Hear rejects uploads above ~25 MB; fail fast with a clear 413.
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 app = FastAPI(title="CallProof API")
 
@@ -156,7 +158,16 @@ def upload(file: UploadFile = File(...)):
     data = file.file.read()
     if not data:
         raise HTTPException(status_code=400, detail="The uploaded file was empty.")
-    log.info("upload received: %s (%.2f MB)", file.filename, len(data) / 1_000_000)
+    size = len(data)
+    log.info("upload received: %s (%.2f MB)", file.filename, size / (1024 * 1024))
+    if size > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"File too large for transcription ({size / (1024 * 1024):.1f} MB). "
+                f"Maximum is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB."
+            ),
+        )
 
     os.makedirs(AUDIO_DIR, exist_ok=True)
     tmp = os.path.join(AUDIO_DIR, "_upload_tmp")
