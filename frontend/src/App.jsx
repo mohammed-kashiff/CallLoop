@@ -126,7 +126,8 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <span className="logo">◆</span> CallProof
+          <span className="logo">◆</span>
+          <span className="brand-name">CallProof</span>
           <span className="tagline">AI Call Quality Auditor</span>
         </div>
         {calls.length > 0 && (
@@ -175,53 +176,6 @@ export default function App() {
       )}
 
       {audit && (
-        <section className={`churn churn-${churnRisk}`}>
-          <div className="churn-head">
-            <span className="churn-title">
-              {churnRisk === "none" ? (
-                <>✓ Churn Risk: <b>NONE</b></>
-              ) : churnRisk === "unknown" ? (
-                <>⚠ Churn Risk: <b>UNAVAILABLE</b></>
-              ) : (
-                <>⚠ Churn Risk: <b>{churnRisk.toUpperCase()}</b></>
-              )}
-            </span>
-            {(churnRisk === "high" || churnRisk === "medium") &&
-              (emailQueued ? (
-                <span className="churn-queued">
-                  ✓ Stakeholder alert queued (email delivery not yet configured)
-                </span>
-              ) : (
-                <button className="churn-email" onClick={() => setEmailQueued(true)}>
-                  ✉ Send Email to Stakeholder
-                </button>
-              ))}
-          </div>
-
-          {churnRisk === "none" ? (
-            <div className="churn-reason">No churn risk detected in this call.</div>
-          ) : churnRisk === "unknown" ? (
-            <div className="churn-reason">Churn risk could not be assessed for this call.</div>
-          ) : (
-            <>
-              <div className="churn-reason">{churn.reasoning}</div>
-              {churn.evidence_text && (
-                <div className="churn-evidence">
-                  <span>“{churn.evidence_text}”</span>
-                  {churn.evidence_verified && <span className="verify ok">✓ verified</span>}
-                  {churnSeg && (
-                    <button className="jump" onClick={() => jumpTo(churnSeg.start)}>
-                      ▶ {fmtTime(churnSeg.start)}
-                    </button>
-                  )}
-                </div>
-              )}
-            </>
-          )}
-        </section>
-      )}
-
-      {audit && (
         <main className="layout">
           <section className="col-left">
             <div className={`score-card ${bandClass(audit.grade)}`}>
@@ -238,7 +192,7 @@ export default function App() {
                 </div>
               </div>
               <button className="rerun" onClick={() => loadAudit(callId, true)}>
-                ↻ Re-run
+                Re-run
               </button>
             </div>
 
@@ -246,6 +200,51 @@ export default function App() {
               Rubric: <b>{audit.rubric}</b> · agent = {audit.agent_speaker} ·{" "}
               {fmtTime(audit.audio_seconds)}
             </div>
+
+            <section className={`churn churn-${churnRisk}`}>
+              <div className="churn-head">
+                <span className="churn-title">
+                  {churnRisk === "none" ? (
+                    <>Churn risk: <b>None</b></>
+                  ) : churnRisk === "unknown" ? (
+                    <>Churn risk: <b>Unavailable</b></>
+                  ) : (
+                    <>Churn risk: <b>{churnRisk}</b></>
+                  )}
+                </span>
+                {(churnRisk === "high" || churnRisk === "medium") &&
+                  (emailQueued ? (
+                    <span className="churn-queued">
+                      Stakeholder alert queued (email delivery not yet configured)
+                    </span>
+                  ) : (
+                    <button className="churn-email" onClick={() => setEmailQueued(true)}>
+                      Send email to stakeholder
+                    </button>
+                  ))}
+              </div>
+
+              {churnRisk === "none" ? (
+                <div className="churn-reason">No churn risk detected in this call.</div>
+              ) : churnRisk === "unknown" ? (
+                <div className="churn-reason">Churn risk could not be assessed for this call.</div>
+              ) : (
+                <>
+                  <div className="churn-reason">{churn.reasoning}</div>
+                  {churn.evidence_text && (
+                    <div className="churn-evidence">
+                      <span>“{churn.evidence_text}”</span>
+                      {churn.evidence_verified && <span className="verify ok">verified</span>}
+                      {churnSeg && (
+                        <button className="jump" onClick={() => jumpTo(churnSeg.start)}>
+                          {fmtTime(churnSeg.start)}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </>
+              )}
+            </section>
 
             <h2 className="h">Findings</h2>
             {audit.findings.map((f) => {
@@ -304,9 +303,9 @@ export default function App() {
                     Customer feedback could not be assessed for this call.
                   </div>
                 ) : (
-                  <>
+                  <div className="fb-grid">
                     <div className="fb-group">
-                      <div className="fb-group-title">About the Agent / Service</div>
+                      <h3 className="fb-group-title">Feedback for agent</h3>
                       {agentFeedback.length > 0 ? (
                         agentFeedback.map((it, i) => {
                           const seg = it.seq != null ? segBySeq[it.seq] : null;
@@ -319,10 +318,10 @@ export default function App() {
                               {it.quote && (
                                 <div className="fb-quote">
                                   <span>“{it.quote}”</span>
-                                  {it.verified && <span className="verify ok">✓</span>}
+                                  {it.verified && <span className="verify ok">verified</span>}
                                   {seg && (
                                     <button className="jump" onClick={() => jumpTo(seg.start)}>
-                                      ▶ {fmtTime(seg.start)}
+                                      {fmtTime(seg.start)}
                                     </button>
                                   )}
                                 </div>
@@ -331,12 +330,12 @@ export default function App() {
                           );
                         })
                       ) : (
-                        <div className="fb-empty">✓ No agent/service feedback detected.</div>
+                        <div className="fb-empty">None detected.</div>
                       )}
                     </div>
 
                     <div className="fb-group">
-                      <div className="fb-group-title">About the Product</div>
+                      <h3 className="fb-group-title">Feedback for product</h3>
                       {productFeedback.length > 0 ? (
                         productFeedback.map((it, i) => {
                           const seg = it.seq != null ? segBySeq[it.seq] : null;
@@ -349,10 +348,10 @@ export default function App() {
                               {it.quote && (
                                 <div className="fb-quote">
                                   <span>“{it.quote}”</span>
-                                  {it.verified && <span className="verify ok">✓</span>}
+                                  {it.verified && <span className="verify ok">verified</span>}
                                   {seg && (
                                     <button className="jump" onClick={() => jumpTo(seg.start)}>
-                                      ▶ {fmtTime(seg.start)}
+                                      {fmtTime(seg.start)}
                                     </button>
                                   )}
                                 </div>
@@ -361,10 +360,10 @@ export default function App() {
                           );
                         })
                       ) : (
-                        <div className="fb-empty">✓ No product feedback detected.</div>
+                        <div className="fb-empty">None detected.</div>
                       )}
                     </div>
-                  </>
+                  </div>
                 )}
               </section>
             )}
