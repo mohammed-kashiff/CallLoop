@@ -113,9 +113,14 @@ export default function App() {
     a.play();
   }
 
-  const churn = audit && audit.churn;
-  const showChurn = churn && ["low", "medium", "high"].includes(churn.risk);
-  const churnSeg = churn && churn.evidence_seq != null ? segBySeq[churn.evidence_seq] : null;
+  const churn = audit?.churn ?? null;
+  const churnRisk = churn?.risk ?? "unknown";
+  const churnSeg = churn?.evidence_seq != null ? segBySeq[churn.evidence_seq] : null;
+
+  const feedback = audit?.feedback ?? null;
+  const feedbackStatus = feedback?.status ?? "ok";
+  const agentFeedback = feedback?.agent ?? [];
+  const productFeedback = feedback?.product ?? [];
 
   return (
     <div className="app">
@@ -169,13 +174,19 @@ export default function App() {
         <div className="banner">Auditing the call… (the first run calls the model)</div>
       )}
 
-      {showChurn && (
-        <div className={`churn churn-${churn.risk}`}>
+      {audit && (
+        <section className={`churn churn-${churnRisk}`}>
           <div className="churn-head">
             <span className="churn-title">
-              ⚠ Churn Risk: <b>{churn.risk.toUpperCase()}</b>
+              {churnRisk === "none" ? (
+                <>✓ Churn Risk: <b>NONE</b></>
+              ) : churnRisk === "unknown" ? (
+                <>⚠ Churn Risk: <b>UNAVAILABLE</b></>
+              ) : (
+                <>⚠ Churn Risk: <b>{churnRisk.toUpperCase()}</b></>
+              )}
             </span>
-            {(churn.risk === "high" || churn.risk === "medium") &&
+            {(churnRisk === "high" || churnRisk === "medium") &&
               (emailQueued ? (
                 <span className="churn-queued">
                   ✓ Stakeholder alert queued (email delivery not yet configured)
@@ -186,19 +197,28 @@ export default function App() {
                 </button>
               ))}
           </div>
-          <div className="churn-reason">{churn.reasoning}</div>
-          {churn.evidence_text && (
-            <div className="churn-evidence">
-              <span>“{churn.evidence_text}”</span>
-              {churn.evidence_verified && <span className="verify ok">✓ verified</span>}
-              {churnSeg && (
-                <button className="jump" onClick={() => jumpTo(churnSeg.start)}>
-                  ▶ {fmtTime(churnSeg.start)}
-                </button>
+
+          {churnRisk === "none" ? (
+            <div className="churn-reason">No churn risk detected in this call.</div>
+          ) : churnRisk === "unknown" ? (
+            <div className="churn-reason">Churn risk could not be assessed for this call.</div>
+          ) : (
+            <>
+              <div className="churn-reason">{churn.reasoning}</div>
+              {churn.evidence_text && (
+                <div className="churn-evidence">
+                  <span>“{churn.evidence_text}”</span>
+                  {churn.evidence_verified && <span className="verify ok">✓ verified</span>}
+                  {churnSeg && (
+                    <button className="jump" onClick={() => jumpTo(churnSeg.start)}>
+                      ▶ {fmtTime(churnSeg.start)}
+                    </button>
+                  )}
+                </div>
               )}
-            </div>
+            </>
           )}
-        </div>
+        </section>
       )}
 
       {audit && (
@@ -275,21 +295,23 @@ export default function App() {
               </>
             )}
 
-            {audit.feedback &&
-              (audit.feedback.agent.length > 0 || audit.feedback.product.length > 0) && (
-                <>
-                  <h2 className="h">Customer Feedback</h2>
-                  {[
-                    ["agent", "About the Agent / Service"],
-                    ["product", "About the Product"],
-                  ].map(([key, label]) =>
-                    audit.feedback[key].length > 0 ? (
-                      <div className="fb-group" key={key}>
-                        <div className="fb-group-title">{label}</div>
-                        {audit.feedback[key].map((it, i) => {
+            {audit.feedback && (
+              <section className="customer-feedback">
+                <h2 className="h">Customer Feedback</h2>
+
+                {feedbackStatus === "error" ? (
+                  <div className="banner error">
+                    Customer feedback could not be assessed for this call.
+                  </div>
+                ) : (
+                  <>
+                    <div className="fb-group">
+                      <div className="fb-group-title">About the Agent / Service</div>
+                      {agentFeedback.length > 0 ? (
+                        agentFeedback.map((it, i) => {
                           const seg = it.seq != null ? segBySeq[it.seq] : null;
                           return (
-                            <div className="fb-item" key={i}>
+                            <div className="fb-item" key={`agent-${i}`}>
                               <div className="fb-item-head">
                                 <span className={`fb-sent fb-${it.sentiment}`}>{it.sentiment}</span>
                                 <span className="fb-summary">{it.summary}</span>
@@ -307,12 +329,46 @@ export default function App() {
                               )}
                             </div>
                           );
-                        })}
-                      </div>
-                    ) : null
-                  )}
-                </>
-              )}
+                        })
+                      ) : (
+                        <div className="fb-empty">✓ No agent/service feedback detected.</div>
+                      )}
+                    </div>
+
+                    <div className="fb-group">
+                      <div className="fb-group-title">About the Product</div>
+                      {productFeedback.length > 0 ? (
+                        productFeedback.map((it, i) => {
+                          const seg = it.seq != null ? segBySeq[it.seq] : null;
+                          return (
+                            <div className="fb-item" key={`product-${i}`}>
+                              <div className="fb-item-head">
+                                <span className={`fb-sent fb-${it.sentiment}`}>{it.sentiment}</span>
+                                <span className="fb-summary">{it.summary}</span>
+                              </div>
+                              {it.quote && (
+                                <div className="fb-quote">
+                                  <span>“{it.quote}”</span>
+                                  {it.verified && <span className="verify ok">✓</span>}
+                                  {seg && (
+                                    <button className="jump" onClick={() => jumpTo(seg.start)}>
+                                      ▶ {fmtTime(seg.start)}
+                                    </button>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })
+                      ) : (
+                        <div className="fb-empty">✓ No product feedback detected.</div>
+                      )}
+                    </div>
+                  </>
+                )}
+              </section>
+            )}
+
           </section>
 
           <section className="col-right">

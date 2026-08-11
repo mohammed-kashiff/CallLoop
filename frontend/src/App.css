@@ -143,3 +143,27 @@
 .fb-neutral { background: #7b8493; }
 .fb-quote { margin-top: 6px; display: flex; align-items: center; gap: 8px;
   font-style: italic; font-size: 13px; color: #3a4557; }
+
+/* Conversation-intelligence empty/error states */
+.churn-none,
+.churn-unknown {
+  opacity: 0.95;
+}
+
+.churn-none .churn-title {
+  font-weight: 600;
+}
+
+.churn-unknown .churn-title {
+  font-weight: 600;
+}
+
+.fb-empty {
+  padding: 10px 0 2px;
+  font-size: 14px;
+  opacity: 0.75;
+}
+
+.customer-feedback .fb-group + .fb-group {
+  margin-top: 18px;
+}
