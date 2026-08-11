@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse
 
 import qa_engine as qa
 import transcribe
+import recap as pyai_recap
 
 logging.basicConfig(
     level=logging.INFO,
@@ -94,6 +95,15 @@ def analyze_call(call_id, agent_override=None):
     coaching = qa.generate_coaching(weak) if weak else []
     churn = qa.assess_churn(transcript_text, segments)
     feedback = qa.extract_feedback(transcript_text, segments)
+    try:
+        call_recap = pyai_recap.ensure_recap(
+            call_id, segments, agent,
+            audio_seconds=meta.get("audio_seconds"),
+            stored_pyai_id=meta.get("pyai_call_id"),
+        )
+    except Exception as e:  # noqa: BLE001
+        log.error("recap failed for call %d: %s", call_id, e)
+        call_recap = {"status": "error", "error": str(e)}
 
     findings = [{
         "id": cr["id"], "name": cr["name"], "method": cr["method"], "weight": cr["weight"],
@@ -112,6 +122,7 @@ def analyze_call(call_id, agent_override=None):
         "segments": segments, "findings": findings, "coaching": coaching,
         "churn": churn,
         "feedback": feedback,
+        "recap": call_recap,
     }
 
 
@@ -182,10 +193,12 @@ def upload(file: UploadFile = File(...)):
             call_id = existing[0]
             log.info("upload deduped to existing call %d (no re-transcription)", call_id)
         else:
-            job_id = transcribe.submit_job_file(tmp)
+            pyai_id = transcribe.new_pyai_call_id()
+            job_id = transcribe.submit_job_file(tmp, call_id=pyai_id)
             result = transcribe.poll_job(job_id)
-            call_id = transcribe.save_transcript(conn, identity, job_id, result)
-            log.info("transcription complete -> new call %d", call_id)
+            call_id = transcribe.save_transcript(
+                conn, identity, job_id, result, pyai_call_id=pyai_id)
+            log.info("transcription complete -> new call %d (pyai_call_id=%s)", call_id, pyai_id)
         conn.close()
         os.replace(tmp, os.path.join(AUDIO_DIR, f"{call_id}.mp3"))
     except HTTPException:

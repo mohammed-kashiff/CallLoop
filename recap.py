@@ -1,0 +1,197 @@
+"""
+CallProof - PyAI Recap client.
+
+Recap does not transcribe; it turns a speaker-labelled utterance list into a
+TL;DR, summary, and action items. Requires the Recap add-on plus recap:read
+(and usually recap:configure to enable the org). Failures are soft — audits
+still succeed without Recap.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+log = logging.getLogger("callproof.recap")
+
+PYAI_API_KEY = os.getenv("PYAI_API_KEY")
+BASE_URL = "https://api.pyai.com"
+RECAP_PACK_ID = os.getenv("RECAP_PACK_ID") or None
+RECAP_POLL_INTERVAL = 2
+RECAP_POLL_ATTEMPTS = 45  # ~90s
+
+HEADERS = {"Authorization": f"Bearer {PYAI_API_KEY}"} if PYAI_API_KEY else {}
+
+
+def pyai_call_id_for(local_call_id: int, stored: str | None = None) -> str:
+    return stored or f"callproof-{local_call_id}"
+
+
+def segments_to_utterances(segments, agent_speaker):
+    """Map CallProof segments to Recap utterances (agent/customer roles)."""
+    out = []
+    for s in segments:
+        start = float(s.get("start") or 0)
+        end = float(s.get("end") or start)
+        text = (s.get("text") or "").strip()
+        if not text:
+            continue
+        role = "agent" if s.get("speaker") == agent_speaker else "customer"
+        out.append({
+            "speaker_role": role,
+            "text": text,
+            "offset_s": start,
+            "duration_s": max(0.0, end - start),
+        })
+    return out
+
+
+def _normalize(payload: dict) -> dict:
+    record = payload.get("record") or {}
+    if not isinstance(record, dict):
+        record = {}
+    action_items = record.get("action_items") or []
+    if not isinstance(action_items, list):
+        action_items = []
+    return {
+        "status": "ok",
+        "pyai_call_id": payload.get("call_id"),
+        "recap_status": payload.get("status"),
+        "headline": payload.get("headline") or record.get("tldr") or "",
+        "tldr": record.get("tldr") or payload.get("headline") or "",
+        "summary": record.get("summary") or record.get("summary_draft") or "",
+        "action_items": [
+            {
+                "owner": (it or {}).get("owner"),
+                "task": (it or {}).get("task"),
+                "due": (it or {}).get("due"),
+            }
+            for it in action_items
+            if isinstance(it, dict)
+        ],
+        "error": payload.get("error"),
+    }
+
+
+def get_recap(pyai_call_id: str):
+    """GET /v1/recap/calls/{id}. Returns (status_code, json_or_none)."""
+    resp = httpx.get(
+        f"{BASE_URL}/v1/recap/calls/{pyai_call_id}",
+        headers=HEADERS,
+        timeout=30,
+    )
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001
+        body = None
+    return resp.status_code, body
+
+
+def trigger_recap(pyai_call_id: str, utterances, audio_seconds=None):
+    """POST utterances to start Recap for an existing transcript."""
+    body = {"utterances": utterances}
+    if audio_seconds is not None:
+        body["call_duration_s"] = float(audio_seconds)
+    if RECAP_PACK_ID:
+        body["pack_id"] = RECAP_PACK_ID
+    resp = httpx.post(
+        f"{BASE_URL}/v1/recap/calls/{pyai_call_id}",
+        headers={**HEADERS, "Content-Type": "application/json"},
+        json=body,
+        timeout=60,
+    )
+    try:
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        data = {"raw": resp.text[:400]}
+    return resp.status_code, data
+
+
+def poll_recap(pyai_call_id: str):
+    last = None
+    for attempt in range(1, RECAP_POLL_ATTEMPTS + 1):
+        code, data = get_recap(pyai_call_id)
+        if code == 404:
+            return None
+        if code == 402:
+            log.warning("recap payment required for %s", pyai_call_id)
+            return {"status": "unavailable", "error": "Recap requires prepaid credit or the Recap add-on."}
+        if code == 401 or code == 403:
+            msg = (data or {}).get("error", {}).get("message") if isinstance(data, dict) else None
+            log.warning("recap auth/scope error %s: %s", code, msg or data)
+            return {
+                "status": "unavailable",
+                "error": msg or "Recap not enabled for this API key (need recap:read / Recap add-on).",
+            }
+        if code != 200 or not isinstance(data, dict):
+            log.warning("recap poll unexpected %s: %s", code, data)
+            return {"status": "error", "error": f"Recap poll failed ({code})."}
+
+        status = data.get("status")
+        if status != last:
+            log.info("recap %s status: %s (attempt %d)", pyai_call_id, status, attempt)
+            last = status
+        if status == "complete":
+            return _normalize(data)
+        if status == "failed":
+            return {
+                "status": "error",
+                "error": data.get("error") or "Recap processing failed.",
+                "pyai_call_id": pyai_call_id,
+            }
+        time.sleep(RECAP_POLL_INTERVAL)
+
+    return {
+        "status": "pending",
+        "error": "Recap still processing; try Re-run shortly.",
+        "pyai_call_id": pyai_call_id,
+    }
+
+
+def ensure_recap(local_call_id, segments, agent_speaker, audio_seconds=None, stored_pyai_id=None):
+    """Fetch Recap for this call, triggering from utterances when needed."""
+    if not PYAI_API_KEY:
+        return {"status": "unavailable", "error": "PYAI_API_KEY not configured."}
+
+    pyai_id = pyai_call_id_for(local_call_id, stored_pyai_id)
+    code, existing = get_recap(pyai_id)
+    if code == 200 and isinstance(existing, dict):
+        if existing.get("status") == "complete":
+            log.info("recap HIT for %s", pyai_id)
+            return _normalize(existing)
+        if existing.get("status") in ("pending", "processing"):
+            return poll_recap(pyai_id)
+        if existing.get("status") == "failed":
+            # Retry once with a fresh utterance submit
+            log.info("recap prior failed for %s; re-triggering", pyai_id)
+
+    utterances = segments_to_utterances(segments, agent_speaker)
+    if not utterances:
+        return {"status": "error", "error": "No utterances available for Recap."}
+
+    t_code, t_body = trigger_recap(pyai_id, utterances, audio_seconds)
+    if t_code not in (200, 202):
+        msg = None
+        if isinstance(t_body, dict):
+            err = t_body.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message")
+            elif isinstance(err, str):
+                msg = err
+            msg = msg or t_body.get("detail") or t_body.get("title")
+        log.warning("recap trigger failed %s: %s", t_code, t_body)
+        if t_code in (401, 403, 402):
+            return {
+                "status": "unavailable",
+                "error": msg or "Recap add-on not enabled for this organization / key.",
+            }
+        return {"status": "error", "error": msg or f"Recap trigger failed ({t_code})."}
+
+    log.info("recap triggered for %s (%s)", pyai_id, t_code)
+    return poll_recap(pyai_id)

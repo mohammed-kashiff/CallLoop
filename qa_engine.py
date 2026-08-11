@@ -48,6 +48,10 @@ MAX_TOKENS = 2000
 def load_call(call_id=None):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(calls)").fetchall()]
+    if "pyai_call_id" not in cols:
+        conn.execute("ALTER TABLE calls ADD COLUMN pyai_call_id TEXT")
+        conn.commit()
     if call_id is None:
         row = conn.execute(
             "SELECT id FROM calls WHERE status='completed' ORDER BY id DESC LIMIT 1").fetchone()
@@ -55,7 +59,8 @@ def load_call(call_id=None):
             sys.exit("No completed calls in the database. Run transcribe.py first.")
         call_id = row["id"]
     meta = conn.execute(
-        "SELECT id, full_text, speakers, audio_seconds FROM calls WHERE id=?", (call_id,)).fetchone()
+        "SELECT id, full_text, speakers, audio_seconds, pyai_call_id FROM calls WHERE id=?",
+        (call_id,)).fetchone()
     if not meta:
         sys.exit(f"No call with id {call_id} in the database.")
     segs = conn.execute(

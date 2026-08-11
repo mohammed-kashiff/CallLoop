@@ -14,6 +14,7 @@ import json
 import logging
 import sqlite3
 import hashlib
+import uuid
 
 import httpx
 from dotenv import load_dotenv
@@ -30,6 +31,7 @@ log = logging.getLogger("callproof.transcribe")
 PYAI_API_KEY = os.getenv("PYAI_API_KEY")
 BASE_URL = "https://api.pyai.com"
 DB_PATH = "callproof.db"
+RECAP_PACK_ID = os.getenv("RECAP_PACK_ID") or None
 
 AUDIO_SOURCE = "/Users/mohammed.kashif/Downloads/test1.mp3"   # only used by the CLI main()
 SEPARATION_MODE = "diarize"    # "diarize" (mono or stereo) | "channel" (true dual-channel)
@@ -58,22 +60,31 @@ def init_db():
     conn.execute("""CREATE TABLE IF NOT EXISTS segments (
         id INTEGER PRIMARY KEY AUTOINCREMENT, call_id INTEGER NOT NULL,
         seq INTEGER, speaker TEXT, channel INTEGER, start REAL, end REAL, text TEXT)""")
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(calls)").fetchall()]
+    if "pyai_call_id" not in cols:
+        conn.execute("ALTER TABLE calls ADD COLUMN pyai_call_id TEXT")
     conn.commit()
     return conn
 
 
+def new_pyai_call_id():
+    return f"callproof_{uuid.uuid4().hex[:12]}"
+
+
 def find_existing_call(conn, identity):
     return conn.execute(
-        "SELECT id FROM calls WHERE audio_url = ? AND status = 'completed'", (identity,)).fetchone()
+        "SELECT id, pyai_call_id FROM calls WHERE audio_url = ? AND status = 'completed'",
+        (identity,)).fetchone()
 
 
-def save_transcript(conn, identity, job_id, result):
+def save_transcript(conn, identity, job_id, result, pyai_call_id=None):
     segments = result.get("segments") or []
     cur = conn.execute(
-        """INSERT INTO calls (audio_url, job_id, status, full_text, speakers, audio_seconds, raw_json)
-           VALUES (?, ?, 'completed', ?, ?, ?, ?)""",
+        """INSERT INTO calls (audio_url, job_id, status, full_text, speakers, audio_seconds,
+           raw_json, pyai_call_id)
+           VALUES (?, ?, 'completed', ?, ?, ?, ?, ?)""",
         (identity, job_id, result.get("text", ""), result.get("speakers"),
-         result.get("audio_seconds"), json.dumps(result)))
+         result.get("audio_seconds"), json.dumps(result), pyai_call_id))
     call_id = cur.lastrowid
     for i, seg in enumerate(segments):
         conn.execute(
@@ -82,27 +93,37 @@ def save_transcript(conn, identity, job_id, result):
             (call_id, i, seg.get("speaker"), seg.get("channel"),
              seg.get("start"), seg.get("end"), seg.get("text")))
     conn.commit()
-    log.info("saved transcript for call %d (%d segments)", call_id, len(segments))
+    log.info("saved transcript for call %d (%d segments, pyai_call_id=%s)",
+             call_id, len(segments), pyai_call_id)
     return call_id
 
 
 # ---------- PyAI service wrapper ----------
-def submit_job_url(audio_url):
+def submit_job_url(audio_url, call_id=None):
     body = {"audio_url": audio_url, "model": MODEL, "numerals": True, "output_formats": ["json"]}
     body.update({"channel": True} if SEPARATION_MODE == "channel" else {"diarize": True})
+    if call_id:
+        body["call_id"] = call_id
+        if RECAP_PACK_ID:
+            body["pack_id"] = RECAP_PACK_ID
     idem = hashlib.sha256(audio_url.encode()).hexdigest()[:32]
     resp = httpx.post(f"{BASE_URL}/v1/transcription/jobs", json=body,
                       headers={**HEADERS, "Idempotency-Key": idem}, timeout=60)
     return _job_id_from(resp)
 
 
-def submit_job_file(path):
+def submit_job_file(path, call_id=None):
     with open(path, "rb") as f:
         audio_bytes = f.read()
     files = {"audio": (os.path.basename(path), audio_bytes, "application/octet-stream")}
     data = {"model": MODEL, "numerals": "true", "output_formats": "json"}
     data.update({"channel": "true"} if SEPARATION_MODE == "channel" else {"diarize": "true"})
-    log.info("submitting %.2f MB to PyAI Hear (%s mode)", len(audio_bytes) / 1_000_000, SEPARATION_MODE)
+    if call_id:
+        data["call_id"] = call_id
+        if RECAP_PACK_ID:
+            data["pack_id"] = RECAP_PACK_ID
+    log.info("submitting %.2f MB to PyAI Hear (%s mode, call_id=%s)",
+             len(audio_bytes) / 1_000_000, SEPARATION_MODE, call_id)
     resp = httpx.post(f"{BASE_URL}/v1/transcription/jobs",
                       files=files, data=data, headers=HEADERS, timeout=120)
     return _job_id_from(resp)
@@ -170,9 +191,10 @@ def main():
     if existing:
         log.info("already transcribed (call id %d) - loading from DB, no API call", existing[0])
         return
-    job_id = submit_job_url(src) if is_url(src) else submit_job_file(src)
+    pyai_id = new_pyai_call_id()
+    job_id = submit_job_url(src, call_id=pyai_id) if is_url(src) else submit_job_file(src, call_id=pyai_id)
     result = poll_job(job_id)
-    call_id = save_transcript(conn, identity, job_id, result)
+    call_id = save_transcript(conn, identity, job_id, result, pyai_call_id=pyai_id)
     log.info("done: call id %d", call_id)
 
 

@@ -132,6 +132,10 @@ export default function App() {
   const agentFeedback = feedback?.agent ?? [];
   const productFeedback = feedback?.product ?? [];
 
+  const callRecap = audit?.recap ?? null;
+  const recapStatus = callRecap?.status ?? null;
+  const recapItems = callRecap?.action_items ?? [];
+
   return (
     <div className="app">
       <header className="topbar">
@@ -257,6 +261,48 @@ export default function App() {
                 </>
               )}
             </section>
+
+            {callRecap && (
+              <section className={`call-recap recap-${recapStatus}`}>
+                <h2 className="h">Call Recap</h2>
+                {recapStatus === "ok" ? (
+                  <>
+                    {(callRecap.tldr || callRecap.headline) && (
+                      <p className="recap-tldr">{callRecap.tldr || callRecap.headline}</p>
+                    )}
+                    {callRecap.summary && (
+                      <p className="recap-summary">{callRecap.summary}</p>
+                    )}
+                    {recapItems.length > 0 && (
+                      <ul className="recap-actions">
+                        {recapItems.map((it, i) => (
+                          <li key={`recap-action-${i}`}>
+                            <span className="recap-task">{it.task}</span>
+                            {(it.owner || it.due) && (
+                              <span className="recap-meta">
+                                {[it.owner, it.due].filter(Boolean).join(" · ")}
+                              </span>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {!callRecap.tldr && !callRecap.headline && !callRecap.summary &&
+                      recapItems.length === 0 && (
+                        <p className="recap-empty">Recap completed with no notes.</p>
+                      )}
+                  </>
+                ) : recapStatus === "pending" ? (
+                  <p className="recap-empty">
+                    {callRecap.error || "Recap still processing. Re-run shortly."}
+                  </p>
+                ) : (
+                  <p className="recap-empty">
+                    {callRecap.error || "Call recap is unavailable for this call."}
+                  </p>
+                )}
+              </section>
+            )}
 
             <h2 className="h">Findings</h2>
             {audit.findings.map((f) => {
