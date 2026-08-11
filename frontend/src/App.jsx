@@ -274,6 +274,45 @@ export default function App() {
                 ))}
               </>
             )}
+
+            {audit.feedback &&
+              (audit.feedback.agent.length > 0 || audit.feedback.product.length > 0) && (
+                <>
+                  <h2 className="h">Customer Feedback</h2>
+                  {[
+                    ["agent", "About the Agent / Service"],
+                    ["product", "About the Product"],
+                  ].map(([key, label]) =>
+                    audit.feedback[key].length > 0 ? (
+                      <div className="fb-group" key={key}>
+                        <div className="fb-group-title">{label}</div>
+                        {audit.feedback[key].map((it, i) => {
+                          const seg = it.seq != null ? segBySeq[it.seq] : null;
+                          return (
+                            <div className="fb-item" key={i}>
+                              <div className="fb-item-head">
+                                <span className={`fb-sent fb-${it.sentiment}`}>{it.sentiment}</span>
+                                <span className="fb-summary">{it.summary}</span>
+                              </div>
+                              {it.quote && (
+                                <div className="fb-quote">
+                                  <span>“{it.quote}”</span>
+                                  {it.verified && <span className="verify ok">✓</span>}
+                                  {seg && (
+                                    <button className="jump" onClick={() => jumpTo(seg.start)}>
+                                      ▶ {fmtTime(seg.start)}
+                                    </button>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : null
+                  )}
+                </>
+              )}
           </section>
 
           <section className="col-right">

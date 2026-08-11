@@ -127,3 +127,19 @@
   padding: 8px 14px; font-weight: 700; font-size: 13px; cursor: pointer; }
 .churn-email:hover { background: #a3291e; }
 .churn-queued { font-size: 13px; font-weight: 700; }
+
+/* customer feedback panels */
+.fb-group { margin-bottom: 10px; }
+.fb-group-title { font-weight: 800; font-size: 12px; text-transform: uppercase;
+  letter-spacing: .5px; color: #66707f; margin: 8px 2px 6px; }
+.fb-item { background: #fff; border: 1px solid #e2e7ee; border-radius: 10px;
+  padding: 10px 13px; margin-bottom: 7px; }
+.fb-item-head { display: flex; align-items: center; gap: 8px; }
+.fb-summary { font-size: 14px; font-weight: 600; }
+.fb-sent { font-size: 10px; font-weight: 800; text-transform: uppercase;
+  padding: 2px 8px; border-radius: 20px; color: #fff; }
+.fb-positive { background: #1f7a54; }
+.fb-negative { background: #c0392b; }
+.fb-neutral { background: #7b8493; }
+.fb-quote { margin-top: 6px; display: flex; align-items: center; gap: 8px;
+  font-style: italic; font-size: 13px; color: #3a4557; }

@@ -77,7 +77,7 @@ def analyze_call(call_id, agent_override=None):
     if not segments:
         raise HTTPException(status_code=422, detail=f"Call {call_id} has no segments")
 
-    agent = agent_override or qa.identify_agent(segments)
+    agent = agent_override or qa.classify_roles(segments)
     transcript_text = qa.format_transcript(segments, agent)
     with open(qa.RUBRIC_PATH) as f:
         rubric = json.load(f)
@@ -91,6 +91,7 @@ def analyze_call(call_id, agent_override=None):
     weak = [(c, r) for c, r in results if r["verdict"] in ("fail", "partial", "unverified")]
     coaching = qa.generate_coaching(weak) if weak else []
     churn = qa.assess_churn(transcript_text, segments)
+    feedback = qa.extract_feedback(transcript_text, segments)
 
     findings = [{
         "id": cr["id"], "name": cr["name"], "method": cr["method"], "weight": cr["weight"],
@@ -108,6 +109,7 @@ def analyze_call(call_id, agent_override=None):
         "gate_fails": gate_fails, "flagged": bool(gate_fails),
         "segments": segments, "findings": findings, "coaching": coaching,
         "churn": churn,
+        "feedback": feedback,
     }
 
 

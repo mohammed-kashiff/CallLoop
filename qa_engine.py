@@ -69,6 +69,32 @@ def identify_agent(segments):
     return segments[0]["speaker"] if segments else None
 
 
+def classify_roles(segments):
+    """Identify the AGENT by content (who greets for a company, explains policy, handles the
+    account) rather than by turn order. Validates the answer; falls back to first speaker."""
+    speakers = sorted({s["speaker"] for s in segments if s.get("speaker")})
+    if len(speakers) < 2:
+        return speakers[0] if speakers else None
+    transcript = "\n".join(f'[{s["speaker"]}] {s["text"]}' for s in segments)
+    prompt = (
+        "Below is a call transcript with speaker labels. Exactly one speaker is the AGENT "
+        "(the company representative) and the other is the CUSTOMER. The agent greets on "
+        "behalf of a company, explains policies/processes, handles the account, and commits "
+        "to next steps.\n\n"
+        f"Speakers: {', '.join(speakers)}\n\nTRANSCRIPT:\n{transcript}\n\n"
+        'Return ONLY this JSON: {"agent_speaker": "<one of the speaker labels>", "reasoning": "<one short sentence>"}'
+    )
+    try:
+        agent = parse_json(call_claude(prompt)).get("agent_speaker")
+        if agent in speakers:
+            log.info("role classification: agent = %s", agent)
+            return agent
+        log.warning("role classification returned invalid speaker '%s'; falling back", agent)
+    except Exception as e:  # noqa: BLE001
+        log.error("role classification failed: %s; falling back to first speaker", e)
+    return identify_agent(segments)
+
+
 def format_transcript(segments, agent_speaker):
     lines = []
     for s in segments:
@@ -364,6 +390,42 @@ def generate_coaching(weak):
         except Exception as e:  # noqa: BLE001
             log.error("coaching attempt %d failed: %s", attempt + 1, e)
     return [{"criterion": c["name"], "tip": "(coaching temporarily unavailable)"} for c, _ in weak]
+
+
+def extract_feedback(transcript_text, segments):
+    """Extract customer feedback, split into feedback about the AGENT/service and about the
+    PRODUCT. Each quote is evidence-validated against the transcript."""
+    prompt = (
+        "Extract any FEEDBACK the CUSTOMER gave during this call, sorted into two buckets:\n"
+        "- 'agent': feedback about the agent or the service experience (helpfulness, treatment, "
+        "wait time, how the issue was handled).\n"
+        "- 'product': feedback about the product or offering itself (features, pricing, "
+        "reliability, bugs, what they wish it did).\n"
+        "Only include things the CUSTOMER actually said. Empty bucket = empty list.\n\n"
+        f"TRANSCRIPT (one turn per line):\n{transcript_text}\n\n"
+        'Return ONLY this JSON:\n'
+        '{"agent": [{"summary":"short paraphrase","sentiment":"positive|negative|neutral",'
+        '"quote":"exact customer line","seq":<seq or null>}], "product":[ ...same shape... ]}'
+    )
+    try:
+        parsed = parse_json(call_claude(prompt))
+    except Exception as e:  # noqa: BLE001
+        log.error("feedback extraction failed: %s", e)
+        return {"agent": [], "product": []}
+    out = {}
+    for bucket in ("agent", "product"):
+        items = []
+        for it in (parsed.get(bucket) or []):
+            quote = (it.get("quote") or "")
+            verified, seq = validate_evidence(quote, segments) if quote else (False, None)
+            items.append({"summary": it.get("summary", ""),
+                          "sentiment": it.get("sentiment", "neutral"),
+                          "quote": quote or None,
+                          "seq": seq if verified else None,
+                          "verified": verified if quote else None})
+        out[bucket] = items
+    log.info("feedback extracted: %d agent, %d product", len(out["agent"]), len(out["product"]))
+    return out
 
 
 CHURN_LEVELS = ["none", "low", "medium", "high"]
