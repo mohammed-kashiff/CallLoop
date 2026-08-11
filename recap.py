@@ -20,13 +20,24 @@ load_dotenv()
 
 log = logging.getLogger("callproof.recap")
 
-PYAI_API_KEY = os.getenv("PYAI_API_KEY")
+PYAI_API_KEY = (os.getenv("PYAI_API_KEY") or "").strip() or None
 BASE_URL = "https://api.pyai.com"
 RECAP_PACK_ID = os.getenv("RECAP_PACK_ID") or None
 RECAP_POLL_INTERVAL = 2
 RECAP_POLL_ATTEMPTS = 45  # ~90s
 
 HEADERS = {"Authorization": f"Bearer {PYAI_API_KEY}"} if PYAI_API_KEY else {}
+
+
+def set_api_key(api_key: str):
+    """Inject / rotate the PyAI key at runtime (used by api.py sandbox mint)."""
+    global PYAI_API_KEY, HEADERS
+    key = (api_key or "").strip()
+    if not key:
+        raise ValueError("PYAI_API_KEY cannot be empty")
+    PYAI_API_KEY = key
+    HEADERS = {"Authorization": f"Bearer {key}"}
+    os.environ["PYAI_API_KEY"] = key
 
 
 def pyai_call_id_for(local_call_id: int, stored: str | None = None) -> str:
