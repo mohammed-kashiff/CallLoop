@@ -41,7 +41,7 @@ RUBRIC_PATH = "rubric.json"
 MODEL = "claude-sonnet-5"
 MAX_HTTP_RETRIES = 4       # attempts per Claude call (with backoff)
 MAX_PARSE_RETRIES = 2      # re-asks if the reply isn't valid JSON
-MAX_TOKENS = 600
+MAX_TOKENS = 2000
 
 
 # ---------- Load transcript ----------
