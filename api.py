@@ -15,6 +15,8 @@ full stack. Sandbox minting is a bootstrap aid, not a production substitute.
 """
 
 import os
+import csv
+import io
 import json
 import hashlib
 import logging
@@ -27,7 +29,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 import qa_v8
 
@@ -506,6 +508,151 @@ def list_calls():
                 item["has_audit"] = True
         out.append(item)
     return out
+
+
+def _coaching_export_text(audit: dict) -> str:
+    """Prefer on-demand coaching tips; fall back to per-finding coaching notes."""
+    tips = []
+    for c in audit.get("coaching") or []:
+        crit = (c.get("criterion") or "").strip()
+        tip = (c.get("tip") or "").strip()
+        if tip:
+            tips.append(f"{crit}: {tip}" if crit else tip)
+    if tips:
+        return " | ".join(tips)
+
+    for f in audit.get("findings") or []:
+        note = (f.get("coaching_note") or "").strip()
+        if note:
+            name = (f.get("name") or f.get("id") or "Finding").strip()
+            tips.append(f"{name}: {note}")
+    return " | ".join(tips)
+
+
+def _recap_export_fields(recap: dict | None) -> tuple[str, str, str]:
+    recap = recap or {}
+    if recap.get("status") and recap.get("status") != "ok":
+        err = (recap.get("error") or recap.get("status") or "").strip()
+        return "", "", err
+    tldr = (recap.get("tldr") or recap.get("headline") or "").strip()
+    summary = (recap.get("summary") or "").strip()
+    actions = []
+    for it in recap.get("action_items") or []:
+        if isinstance(it, dict):
+            task = (it.get("task") or "").strip()
+            meta = " · ".join(
+                x for x in [(it.get("owner") or "").strip(), (it.get("due") or "").strip()] if x
+            )
+            if task:
+                actions.append(f"{task} ({meta})" if meta else task)
+        elif it:
+            actions.append(str(it).strip())
+    return tldr, summary, " | ".join(actions)
+
+
+def _ratings_export_text(findings: list | None) -> str:
+    parts = []
+    for f in findings or []:
+        name = f.get("name") or f.get("id") or "criterion"
+        verdict = f.get("verdict") or ""
+        pts = f.get("points")
+        weight = f.get("weight")
+        if pts is not None and weight is not None:
+            parts.append(f"{name}={verdict} ({pts}/{weight})")
+        else:
+            parts.append(f"{name}={verdict}")
+    return " | ".join(parts)
+
+
+@app.get("/api/calls/export")
+def export_calls(format: str = "csv"):
+    """
+    One-click bulk export of score/grade, finding ratings, recap, and coaching.
+    Omits raw transcripts. Defaults to CSV download; use format=json for JSON.
+    """
+    fmt = (format or "csv").strip().lower()
+    if fmt not in ("csv", "json"):
+        raise HTTPException(status_code=400, detail="format must be csv or json")
+
+    with _conn() as c:
+        rows = c.execute(
+            """
+            SELECT
+              c.id,
+              c.status,
+              c.audio_seconds,
+              c.created_at,
+              a.audit_json,
+              a.created_at AS audited_at
+            FROM calls c
+            INNER JOIN audits a ON a.call_id = c.id
+            WHERE c.status = 'completed' OR c.status IS NULL OR c.status = ''
+            ORDER BY c.id ASC
+            """
+        ).fetchall()
+
+    records = []
+    for r in rows:
+        try:
+            audit = json.loads(r["audit_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(audit, dict):
+            continue
+
+        recap_tldr, recap_summary, recap_actions = _recap_export_fields(audit.get("recap"))
+        coaching = _coaching_export_text(audit)
+        churn = audit.get("churn") or {}
+        records.append({
+            "call_id": r["id"],
+            "created_at": r["created_at"] or "",
+            "audited_at": r["audited_at"] or "",
+            "audio_seconds": r["audio_seconds"],
+            "score": audit.get("score"),
+            "grade": audit.get("grade") or "",
+            "flagged": bool(audit.get("flagged")),
+            "churn_risk": (churn.get("risk") or ""),
+            "ratings": _ratings_export_text(audit.get("findings")),
+            "recap_tldr": recap_tldr,
+            "recap_summary": recap_summary,
+            "recap_actions": recap_actions,
+            "coaching": coaching,
+        })
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    applog.event(log, "calls_exported", count=len(records), format=fmt)
+    log.info("bulk export %d audited call(s) as %s", len(records), fmt)
+
+    if fmt == "json":
+        body = json.dumps({"exported_at": stamp, "count": len(records), "calls": records}, indent=2)
+        return Response(
+            content=body,
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="callproof-export-{stamp}.json"',
+            },
+        )
+
+    buf = io.StringIO()
+    fields = [
+        "call_id", "created_at", "audited_at", "audio_seconds",
+        "score", "grade", "flagged", "churn_risk", "ratings",
+        "recap_tldr", "recap_summary", "recap_actions", "coaching",
+    ]
+    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for rec in records:
+        writer.writerow(rec)
+
+    # UTF-8 BOM helps Excel open the CSV cleanly
+    content = "\ufeff" + buf.getvalue()
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="callproof-export-{stamp}.csv"',
+        },
+    )
 
 
 @app.get("/api/calls/{call_id}/audit")

@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
+  <title id="title">Call Loop logo</title>
+  <desc id="desc">An infinity loop combining a telephone handset and audio analytics bars, followed by the words Call Loop.</desc>
+  <defs>
+    <linearGradient id="loop" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#14B8A6"/>
+      <stop offset="52%" stop-color="#2563EB"/>
+      <stop offset="100%" stop-color="#8B5CF6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Icon -->
+  <g transform="translate(70 72)">
+    <!-- Infinity / continuous QA loop -->
+    <path d="M70 138
+             C112 68 176 68 225 138
+             C270 202 323 202 370 138"
+          fill="none" stroke="url(#loop)" stroke-width="34" stroke-linecap="round"/>
+    <path d="M70 138
+             C112 208 176 208 225 138
+             C270 74 323 74 370 138"
+          fill="none" stroke="url(#loop)" stroke-width="34" stroke-linecap="round"/>
+
+    <!-- Phone handset -->
+    <path d="M69 89
+             C69 60 87 43 112 43
+             L132 43
+             C144 43 152 51 152 63
+             L152 91
+             C152 101 146 109 137 113
+             L123 119
+             C143 154 170 180 205 198
+             L215 183
+             C221 174 232 169 243 172
+             L270 181
+             C282 185 289 197 286 209
+             L281 229
+             C277 254 255 270 230 266
+             C142 252 82 192 68 104
+             C67 99 67 94 69 89Z"
+          fill="#0B1F44"/>
+
+    <!-- AI analysis bars -->
+    <g transform="translate(246 88)" fill="#FFFFFF">
+      <rect x="0" y="48" width="13" height="44" rx="6.5"/>
+      <rect x="25" y="28" width="13" height="64" rx="6.5"/>
+      <rect x="50" y="7" width="13" height="85" rx="6.5"/>
+      <rect x="75" y="28" width="13" height="64" rx="6.5"/>
+      <rect x="100" y="48" width="13" height="44" rx="6.5"/>
+    </g>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="500" y="195"
+        font-family="Inter, Arial, Helvetica, sans-serif"
+        font-size="96" font-weight="800" letter-spacing="-3"
+        fill="#0B1F44">CALL</text>
+  <text x="745" y="195"
+        font-family="Inter, Arial, Helvetica, sans-serif"
+        font-size="96" font-weight="800" letter-spacing="-3"
+        fill="url(#loop)">LOOP</text>
+
+  <text x="505" y="250"
+        font-family="Inter, Arial, Helvetica, sans-serif"
+        font-size="24" font-weight="600" letter-spacing="6"
+        fill="#52637A">QA AUDITING • INTELLIGENT ANALYSIS</text>
+</svg>
