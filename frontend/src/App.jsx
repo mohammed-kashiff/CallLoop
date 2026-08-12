@@ -4,6 +4,7 @@ import "./App.css";
 const API = "http://localhost:8000";
 const MAX_UPLOAD_MB = 25;
 const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
+const MAX_BULK_FILES = 5;
 const FRACTION = { pass: 1, partial: 0.5, fail: 0, unverified: 0, error: 0 };
 
 function fmtTime(s) {
@@ -54,7 +55,7 @@ function JobProgress({ active, phase, fromUpload }) {
   if (!active) return null;
 
   // Upload→audit pipeline: transcribe 0–55%, then audit 55–95%.
-  // Audit-only (Re-run): start at 0% so it doesn't jump to mid-bar.
+  // Audit-only load: start at 0% so it doesn't jump to mid-bar.
   const pipelineAudit = phase === "audit" && fromUpload;
   const phaseFloor = pipelineAudit ? 55 : 0;
   const phaseSpan = pipelineAudit ? 40 : 90;
@@ -113,11 +114,17 @@ export default function App() {
   const [pipelineActive, setPipelineActive] = useState(false);
   const [jobFromUpload, setJobFromUpload] = useState(false);
   const [uploadError, setUploadError] = useState(null);
+  const [bulkJobs, setBulkJobs] = useState([]); // [{key,name,status,callId,score,error,sizeMb}]
+  const [bulkNote, setBulkNote] = useState(null);
+  const [bulkRunning, setBulkRunning] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [emailStatus, setEmailStatus] = useState(null); // null | opening | opened | error
   const [emailMessage, setEmailMessage] = useState(null);
   const [coachingLoading, setCoachingLoading] = useState(false);
   const [coachingError, setCoachingError] = useState(null);
+  const [showLibrary, setShowLibrary] = useState(false);
+  const [manualReviewFlagged, setManualReviewFlagged] = useState(false);
+  const [manualReviewMessage, setManualReviewMessage] = useState(null);
   const audioRef = useRef(null);
   const fileInputRef = useRef(null);
 
@@ -140,15 +147,17 @@ export default function App() {
       );
   }, []);
 
-  function loadAudit(id, refresh = false) {
+  function loadAudit(id) {
     setLoading(true);
     setError(null);
     setEmailStatus(null);
     setEmailMessage(null);
     setCoachingError(null);
     setCoachingLoading(false);
-    if (!refresh) setAudit(null);
-    fetch(`${API}/api/calls/${id}/audit${refresh ? "?refresh=true" : ""}`)
+    setManualReviewFlagged(false);
+    setManualReviewMessage(null);
+    setAudit(null);
+    fetch(`${API}/api/calls/${id}/audit`)
       .then((r) => {
         if (!r.ok) throw new Error();
         return r.json();
@@ -163,8 +172,131 @@ export default function App() {
   }
 
   useEffect(() => {
+    // Bulk import loads audits itself; skip the auto-fetch until the batch finishes.
+    if (bulkRunning) return;
     if (callId != null) loadAudit(callId);
-  }, [callId]);
+  }, [callId, bulkRunning]);
+
+  function patchBulkJob(key, patch) {
+    setBulkJobs((prev) =>
+      prev.map((j) => (j.key === key ? { ...j, ...patch } : j)),
+    );
+  }
+
+  async function uploadOneFile(file) {
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await fetch(`${API}/api/upload`, { method: "POST", body: fd });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      const detail = typeof d.detail === "string" ? d.detail : "Upload failed";
+      throw new Error(detail);
+    }
+    const data = await r.json();
+    return data.call_id;
+  }
+
+  async function fetchAuditJson(id) {
+    const r = await fetch(`${API}/api/calls/${id}/audit`);
+    if (!r.ok) throw new Error("Could not load the audit for this call.");
+    return r.json();
+  }
+
+  async function handleFiles(fileList) {
+    const all = Array.from(fileList || []).filter(Boolean);
+    if (!all.length || bulkRunning || uploading) return;
+
+    setUploadError(null);
+    setBulkNote(null);
+
+    let selected = all;
+    if (all.length > MAX_BULK_FILES) {
+      selected = all.slice(0, MAX_BULK_FILES);
+      setBulkNote(
+        `Only the first ${MAX_BULK_FILES} files will be imported (${all.length} selected).`,
+      );
+    }
+
+    const jobs = selected.map((f, i) => {
+      const tooBig = f.size > MAX_UPLOAD_BYTES;
+      const mb = (f.size / (1024 * 1024)).toFixed(1);
+      return {
+        key: `${Date.now()}-${i}-${f.name}`,
+        name: f.name || `file-${i + 1}`,
+        sizeMb: mb,
+        status: tooBig ? "failed" : "queued",
+        callId: null,
+        score: null,
+        error: tooBig
+          ? `File too large (${mb} MB). Maximum is ${MAX_UPLOAD_MB} MB.`
+          : null,
+        file: f,
+      };
+    });
+    setBulkJobs(jobs.map(({ file, ...rest }) => rest));
+
+    const work = jobs.filter((j) => j.status !== "failed");
+    if (!work.length) {
+      setUploadError("No files within the 25 MB limit to import.");
+      return;
+    }
+
+    setBulkRunning(true);
+    setJobFromUpload(true);
+    setPipelineActive(true);
+    setUploading(true);
+
+    let lastOkId = null;
+    let lastAudit = null;
+
+    try {
+      for (const job of work) {
+        patchBulkJob(job.key, { status: "uploading", error: null });
+        setUploading(true);
+        try {
+          const call_id = await uploadOneFile(job.file);
+          patchBulkJob(job.key, { status: "auditing", callId: call_id });
+          setUploading(false);
+          setLoading(true);
+
+          const auditJson = await fetchAuditJson(call_id);
+          patchBulkJob(job.key, {
+            status: "done",
+            callId: call_id,
+            score: auditJson.score,
+          });
+          lastOkId = call_id;
+          lastAudit = auditJson;
+        } catch (e) {
+          patchBulkJob(job.key, {
+            status: "failed",
+            error: e.message || "Import failed",
+          });
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      await refreshCalls();
+      if (lastOkId != null) {
+        // Show the last completed audit; dropdown can switch to any other.
+        setCallId(lastOkId);
+        if (lastAudit) setAudit(lastAudit);
+      }
+    } finally {
+      setUploading(false);
+      setPipelineActive(false);
+      setJobFromUpload(false);
+      setBulkRunning(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  function onDrop(e) {
+    e.preventDefault();
+    setDragOver(false);
+    if (!bulkRunning && !uploading) handleFiles(e.dataTransfer.files);
+  }
 
   async function loadCoaching() {
     if (callId == null || coachingLoading) return;
@@ -221,46 +353,13 @@ export default function App() {
     }
   }
 
-  async function handleFiles(files) {
-    const f = files && files[0];
-    if (!f) return;
-    setUploadError(null);
-    if (f.size > MAX_UPLOAD_BYTES) {
-      const mb = (f.size / (1024 * 1024)).toFixed(1);
-      setUploadError(
-        `File too large for transcription (${mb} MB). Maximum is ${MAX_UPLOAD_MB} MB.`,
-      );
-      return;
-    }
-    setJobFromUpload(true);
-    setPipelineActive(true);
-    setUploading(true);
-    try {
-      const fd = new FormData();
-      fd.append("file", f);
-      const r = await fetch(`${API}/api/upload`, { method: "POST", body: fd });
-      if (!r.ok) {
-        const d = await r.json().catch(() => ({}));
-        const detail = typeof d.detail === "string" ? d.detail : "Upload failed";
-        throw new Error(detail);
-      }
-      const { call_id } = await r.json();
-      await refreshCalls();
-      setCallId(call_id);
-      // Keep pipelineActive true until audit finishes so the timer doesn't reset.
-    } catch (e) {
-      setUploadError(e.message || "Upload failed");
-      setPipelineActive(false);
-      setJobFromUpload(false);
-    } finally {
-      setUploading(false);
-    }
-  }
-
-  function onDrop(e) {
-    e.preventDefault();
-    setDragOver(false);
-    if (!uploading) handleFiles(e.dataTransfer.files);
+  function flagForManualReview() {
+    if (callId == null || manualReviewFlagged) return;
+    // Backend / workflow logic TBD — UI placeholder only for now.
+    setManualReviewFlagged(true);
+    setManualReviewMessage(
+      `Call #${callId} flagged for manual review. Workflow rules will be wired next.`,
+    );
   }
 
   const segBySeq = {};
@@ -294,12 +393,18 @@ export default function App() {
       ["fail", "partial", "unverified"].includes(f.verdict),
     ).length ?? 0;
 
-  const jobActive = uploading || loading || pipelineActive;
+  const jobActive = uploading || loading || pipelineActive || bulkRunning;
   const jobPhase = uploading
     ? "transcribe"
     : loading || pipelineActive
       ? "audit"
       : null;
+
+  const bulkDoneCount = bulkJobs.filter((j) => j.status === "done").length;
+  const bulkFailedCount = bulkJobs.filter((j) => j.status === "failed").length;
+  const scoreByCallId = Object.fromEntries(
+    bulkJobs.filter((j) => j.callId != null && j.score != null).map((j) => [j.callId, j.score]),
+  );
 
   return (
     <div className="app">
@@ -309,48 +414,225 @@ export default function App() {
           <span className="brand-name">CallProof</span>
           <span className="tagline">AI Call Quality Auditor</span>
         </div>
-        {calls.length > 0 && (
-          <select
-            className="call-select"
-            value={callId ?? ""}
-            onChange={(e) => setCallId(Number(e.target.value))}
-            disabled={jobActive}
+        <div className="topbar-actions">
+          <button
+            type="button"
+            className={`library-toggle ${showLibrary ? "on" : ""}`}
+            onClick={() => setShowLibrary((v) => !v)}
           >
-            {calls.map((c) => (
-              <option key={c.id} value={c.id}>
-                Call #{c.id} — {fmtTime(c.audio_seconds)}
-              </option>
-            ))}
-          </select>
-        )}
+            {showLibrary ? "Hide library" : "Calls library"}
+          </button>
+          {calls.filter((c) => c.status === "completed" || !c.status).length > 0 && (
+            <label className="call-select-wrap">
+              <span className="call-select-label">View audit</span>
+              <select
+                className="call-select"
+                value={callId ?? ""}
+                onChange={(e) => setCallId(Number(e.target.value))}
+                disabled={jobActive}
+              >
+                {calls
+                  .filter((c) => c.status === "completed" || !c.status)
+                  .map((c) => {
+                  const scored = scoreByCallId[c.id] ?? c.score;
+                  const scoreLabel =
+                    scored != null
+                      ? ` — score ${scored}`
+                      : callId === c.id && audit?.score != null
+                        ? ` — score ${audit.score}`
+                        : "";
+                  return (
+                    <option key={c.id} value={c.id}>
+                      Call #{c.id} — {fmtTime(c.audio_seconds)}
+                      {scoreLabel}
+                    </option>
+                  );
+                })}
+              </select>
+            </label>
+          )}
+        </div>
       </header>
 
+      {showLibrary && (
+        <section className="calls-library" aria-label="Stored calls library">
+          <div className="calls-library-head">
+            <div>
+              <h2 className="calls-library-title">Stored calls</h2>
+              <p className="calls-library-sub">
+                From local SQLite (<code>callproof.db</code>) — {calls.length} call
+                {calls.length === 1 ? "" : "s"}
+              </p>
+            </div>
+            <button
+              type="button"
+              className="library-refresh"
+              disabled={jobActive}
+              onClick={() => refreshCalls().catch(() => setError("Could not refresh calls."))}
+            >
+              Refresh
+            </button>
+          </div>
+          {calls.length === 0 ? (
+            <p className="calls-library-empty">No calls stored yet. Upload a recording to begin.</p>
+          ) : (
+            <div className="calls-library-table-wrap">
+              <table className="calls-library-table">
+                <thead>
+                  <tr>
+                    <th>Call</th>
+                    <th>Status</th>
+                    <th>Duration</th>
+                    <th>Speakers</th>
+                    <th>Segments</th>
+                    <th>Score</th>
+                    <th>Stored</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {calls.map((c) => {
+                    const active = callId === c.id;
+                    return (
+                      <tr key={c.id} className={active ? "active" : ""}>
+                        <td className="mono">#{c.id}</td>
+                        <td>
+                          <span className={`lib-pill status-${c.status || "unknown"}`}>
+                            {c.status || "unknown"}
+                          </span>
+                        </td>
+                        <td>{fmtTime(c.audio_seconds)}</td>
+                        <td>{c.speakers ?? "—"}</td>
+                        <td>{c.segment_count ?? "—"}</td>
+                        <td>
+                          {c.has_audit ? (
+                            <span title={c.audit_fresh ? "Audit cache is current" : "Rubric changed since this score was cached"}>
+                              {c.score != null ? c.score : "—"}
+                              {c.grade ? ` · ${c.grade}` : ""}
+                              {!c.audit_fresh && c.has_audit ? " *" : ""}
+                            </span>
+                          ) : (
+                            <span className="muted">not audited</span>
+                          )}
+                        </td>
+                        <td className="muted small">
+                          {(c.created_at || "").replace("T", " ").slice(0, 19) || "—"}
+                        </td>
+                        <td>
+                          <button
+                            type="button"
+                            className="lib-open"
+                            disabled={jobActive || (active && !!audit)}
+                            onClick={() => {
+                              setCallId(c.id);
+                              setShowLibrary(false);
+                            }}
+                          >
+                            {active ? "Viewing" : "Open audit"}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <p className="calls-library-hint">
+            * Score marked with an asterisk may be stale after a rubric change
+            (cached audit was scored under an older rubric).
+          </p>
+        </section>
+      )}
+
       <div
-        className={`dropzone ${dragOver ? "over" : ""} ${uploading ? "busy" : ""}`}
+        className={`dropzone ${dragOver ? "over" : ""} ${jobActive ? "busy" : ""}`}
         onDragOver={(e) => {
           e.preventDefault();
-          if (!uploading) setDragOver(true);
+          if (!jobActive) setDragOver(true);
         }}
         onDragLeave={() => setDragOver(false)}
         onDrop={onDrop}
-        onClick={() => !uploading && fileInputRef.current && fileInputRef.current.click()}
+        onClick={() => !jobActive && fileInputRef.current && fileInputRef.current.click()}
       >
         <input
           ref={fileInputRef}
           type="file"
           accept="audio/*"
+          multiple
           hidden
           onChange={(e) => handleFiles(e.target.files)}
         />
-        {uploading ? (
+        {bulkRunning ? (
+          <span>
+            Importing batch — {bulkDoneCount + bulkFailedCount} / {bulkJobs.length} finished
+          </span>
+        ) : uploading ? (
           <span>Transcribing in progress — see timer below</span>
         ) : (
           <span>
-            Drag a call recording here, or click to choose a file (max {MAX_UPLOAD_MB} MB)
+            Drag up to {MAX_BULK_FILES} call recordings here, or click to choose
+            files (max {MAX_UPLOAD_MB} MB each)
           </span>
         )}
       </div>
+      {bulkNote && <div className="banner">{bulkNote}</div>}
       {uploadError && <div className="banner error">{uploadError}</div>}
+
+      {bulkJobs.length > 0 && (
+        <section className="bulk-progress" aria-live="polite">
+          <div className="bulk-progress-head">
+            <h2 className="bulk-progress-title">Batch import</h2>
+            <span className="bulk-progress-count">
+              {bulkDoneCount} done
+              {bulkFailedCount ? ` · ${bulkFailedCount} failed` : ""}
+              {" · "}
+              {bulkJobs.length} total
+            </span>
+          </div>
+          <ul className="bulk-job-list">
+            {bulkJobs.map((j) => (
+              <li key={j.key} className={`bulk-job status-${j.status}`}>
+                <div className="bulk-job-main">
+                  <span className="bulk-job-name" title={j.name}>
+                    {j.name}
+                  </span>
+                  <span className="bulk-job-status">
+                    {j.status === "queued" && "Queued"}
+                    {j.status === "uploading" && "Uploading / transcribing…"}
+                    {j.status === "auditing" && "Auditing…"}
+                    {j.status === "done" && (
+                      <>
+                        Done
+                        {j.callId != null && ` · Call #${j.callId}`}
+                        {j.score != null && ` · score ${j.score}`}
+                      </>
+                    )}
+                    {j.status === "failed" && "Failed"}
+                  </span>
+                </div>
+                <div className="bulk-job-meta">
+                  <span>{j.sizeMb} MB</span>
+                  {j.status === "done" && j.callId != null && (
+                    <button
+                      type="button"
+                      className="bulk-job-view"
+                      disabled={jobActive || callId === j.callId}
+                      onClick={() => setCallId(j.callId)}
+                    >
+                      View audit
+                    </button>
+                  )}
+                </div>
+                {j.error && <div className="bulk-job-error">{j.error}</div>}
+              </li>
+            ))}
+          </ul>
+          <p className="bulk-progress-hint">
+            Use the <b>View audit</b> dropdown above to switch between completed calls.
+          </p>
+        </section>
+      )}
 
       {error && <div className="banner error">{error}</div>}
       <JobProgress
@@ -375,9 +657,19 @@ export default function App() {
                   ))}
                 </div>
               </div>
-              <button className="rerun" onClick={() => loadAudit(callId, true)}>
-                Re-run
-              </button>
+              <div className="score-actions">
+                <button
+                  type="button"
+                  className={`flag-review ${manualReviewFlagged ? "flagged" : ""}`}
+                  onClick={flagForManualReview}
+                  disabled={manualReviewFlagged}
+                >
+                  {manualReviewFlagged ? "Flagged for review" : "Flag for manual review"}
+                </button>
+                {manualReviewMessage && (
+                  <div className="flag-review-msg">{manualReviewMessage}</div>
+                )}
+              </div>
             </div>
 
             <div className="rubric-line">
@@ -476,7 +768,7 @@ export default function App() {
                   </>
                 ) : recapStatus === "pending" ? (
                   <p className="recap-empty">
-                    {callRecap.error || "Recap still processing. Re-run shortly."}
+                    {callRecap.error || "Recap still processing. Try again shortly."}
                   </p>
                 ) : callRecap.reason === "sandbox_key" ||
                   /sandbox/i.test(callRecap.error || "") ? (
@@ -490,7 +782,8 @@ export default function App() {
                       console.pyai.com
                     </a>{" "}
                     to create a live API key, add it to <code>.env</code> as{" "}
-                    <code>PYAI_API_KEY</code>, restart the API, then re-run the audit.
+                    <code>PYAI_API_KEY</code>, restart the API, then open this call again
+                    after a fresh audit (e.g. new upload).
                   </p>
                 ) : (
                   <p className="recap-empty">

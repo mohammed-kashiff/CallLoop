@@ -127,17 +127,29 @@ def _mint_sandbox_key():
             )
             return None
 
-        if resp.status_code == 429:
+        if resp.status_code in (429, 529):
+            detail = ""
+            try:
+                body = resp.json()
+                detail = body.get("detail") or body.get("title") or ""
+            except Exception:
+                detail = (resp.text or "")[:200]
             log.warning(
-                "sandbox key rate limited. Try again in a moment.\n"
-                "   ➤ Or add a live PYAI_API_KEY to .env manually."
+                "sandbox key minting failed (HTTP %s)%s\n"
+                "   ➤ This network has hit PyAI's sandbox-key limit.\n"
+                "   ➤ Change to a different internet connection (e.g. phone hotspot) and retry,\n"
+                "   ➤ or add a live PYAI_API_KEY from https://console.pyai.com to .env and restart.",
+                resp.status_code,
+                f": {detail}" if detail else "",
             )
             return None
 
         if resp.status_code != 201:
             log.warning(
-                "unexpected response minting sandbox key: %s %s",
-                resp.status_code, resp.text[:200],
+                "sandbox key minting failed (HTTP %s): %s\n"
+                "   ➤ Add a live PYAI_API_KEY to .env manually and restart.",
+                resp.status_code,
+                resp.text[:200],
             )
             return None
 
@@ -406,12 +418,60 @@ def _weak_from_findings(findings):
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/api/calls")
 def list_calls():
+    """
+    Library listing of stored calls (SQLite). Omits raw transcript / raw_json
+    payloads — those stay on the audit/detail paths.
+    """
+    rh = _rubric_hash()
     with _conn() as c:
         rows = c.execute(
-            "SELECT id, audio_seconds, speakers FROM calls "
-            "WHERE status='completed' ORDER BY id DESC"
+            """
+            SELECT
+              c.id,
+              c.status,
+              c.audio_seconds,
+              c.speakers,
+              c.created_at,
+              c.pyai_call_id,
+              c.job_id,
+              (SELECT COUNT(*) FROM segments s WHERE s.call_id = c.id) AS segment_count,
+              a.audit_json,
+              a.rubric_hash,
+              a.created_at AS audited_at
+            FROM calls c
+            LEFT JOIN audits a ON a.call_id = c.id
+            ORDER BY c.id DESC
+            """
         ).fetchall()
-    return [dict(r) for r in rows]
+
+    out = []
+    for r in rows:
+        item = {
+            "id": r["id"],
+            "status": r["status"],
+            "audio_seconds": r["audio_seconds"],
+            "speakers": r["speakers"],
+            "created_at": r["created_at"],
+            "pyai_call_id": r["pyai_call_id"],
+            "job_id": r["job_id"],
+            "segment_count": r["segment_count"] or 0,
+            "has_audit": False,
+            "audit_fresh": False,
+            "score": None,
+            "grade": None,
+            "audited_at": r["audited_at"],
+        }
+        if r["audit_json"]:
+            try:
+                cached = json.loads(r["audit_json"])
+                item["has_audit"] = True
+                item["audit_fresh"] = r["rubric_hash"] == rh
+                item["score"] = cached.get("score")
+                item["grade"] = cached.get("grade")
+            except (TypeError, json.JSONDecodeError):
+                item["has_audit"] = True
+        out.append(item)
+    return out
 
 
 @app.get("/api/calls/{call_id}/audit")

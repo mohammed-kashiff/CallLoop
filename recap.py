@@ -182,7 +182,7 @@ def poll_recap(pyai_call_id: str):
 
     return {
         "status": "pending",
-        "error": "Recap still processing; try Re-run shortly.",
+        "error": "Recap still processing; try again shortly.",
         "pyai_call_id": pyai_call_id,
     }
 
