@@ -20,6 +20,7 @@ import json
 import time
 import logging
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 from dotenv import load_dotenv
@@ -331,6 +332,140 @@ def evaluate_criterion(criterion, segments, agent_speaker, transcript_text):
     return run_llm_criterion(criterion, transcript_text, segments)
 
 
+def evaluate_all_criteria(criteria, segments, agent_speaker, transcript_text, max_workers=None):
+    """Evaluate every rubric criterion concurrently (one Claude call per LLM criterion)."""
+    n = len(criteria)
+    if n == 0:
+        return []
+    workers = max_workers or min(16, n)
+    ordered = [None] * n
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {
+            pool.submit(
+                evaluate_criterion, cr, segments, agent_speaker, transcript_text
+            ): (i, cr)
+            for i, cr in enumerate(criteria)
+        }
+        for fut in as_completed(futs):
+            i, cr = futs[fut]
+            ordered[i] = (cr, fut.result())
+    log.info(
+        "evaluated %d criteria in parallel in %.1fs (workers=%d)",
+        n, time.perf_counter() - t0, workers,
+    )
+    return ordered
+
+
+def draft_retention_email(transcript_text, segments):
+    """
+    Draft a stakeholder retention email from the transcript (one Claude call).
+    Intended to run in the parallel audit wave alongside churn/feedback/criteria.
+    """
+    prompt = (
+        "You are a customer-retention specialist writing an INTERNAL email a manager can send "
+        "to a stakeholder about retaining this customer after the call below.\n\n"
+        "Analyze the transcript for churn risk, unmet needs, frustration, competitors, "
+        "pricing/product issues, and what concrete retention steps would help.\n"
+        "Use ONLY facts supported by the transcript. Do not invent discounts, credits, or "
+        "commitments that were not discussed. Keep the tone professional and actionable.\n\n"
+        f"TRANSCRIPT (one turn per line):\n{transcript_text}\n\n"
+        "Return ONLY this JSON:\n"
+        "{"
+        '"subject": "short email subject", '
+        '"body": "plain-text email body with short paragraphs and a clear ask/next steps", '
+        '"summary": "1-2 sentence situation summary", '
+        '"suggested_actions": ["specific next step 1", "specific next step 2"]'
+        "}"
+    )
+    try:
+        parsed = parse_json(call_claude(prompt))
+    except Exception as e:  # noqa: BLE001
+        log.error("retention email draft failed: %s", e)
+        return {
+            "status": "error",
+            "error": str(e),
+            "subject": "",
+            "body": "",
+            "summary": "",
+            "suggested_actions": [],
+        }
+
+    subject = (parsed.get("subject") or "").strip()
+    body = (parsed.get("body") or "").strip()
+    summary = (parsed.get("summary") or "").strip()
+    actions = parsed.get("suggested_actions") or []
+    if not isinstance(actions, list):
+        actions = []
+    actions = [str(a).strip() for a in actions if str(a).strip()]
+
+    # Light grounding: if body empty, treat as failure for compose fallback.
+    if not body:
+        log.warning("retention email draft returned empty body")
+        return {
+            "status": "error",
+            "error": "Model returned an empty retention email body.",
+            "subject": subject,
+            "body": "",
+            "summary": summary,
+            "suggested_actions": actions,
+        }
+
+    log.info(
+        "retention email drafted (%d chars, %d actions)",
+        len(body), len(actions),
+    )
+    return {
+        "status": "ok",
+        "subject": subject,
+        "body": body,
+        "summary": summary,
+        "suggested_actions": actions,
+    }
+
+
+def run_parallel_claude_wave(criteria, segments, agent_speaker, transcript_text, max_workers=None):
+    """
+    Fire all independent Claude work in one parallel wave:
+    every rubric criterion + churn + customer feedback + retention email draft.
+    Coaching is NOT included (it depends on weak-area results).
+    """
+    n = len(criteria)
+    workers = max_workers or min(32, max(4, n + 3))
+    ordered = [None] * n
+    churn = None
+    feedback = None
+    retention_email = None
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {}
+        for i, cr in enumerate(criteria):
+            futs[pool.submit(
+                evaluate_criterion, cr, segments, agent_speaker, transcript_text
+            )] = ("crit", i, cr)
+        futs[pool.submit(assess_churn, transcript_text, segments)] = ("churn", None, None)
+        futs[pool.submit(extract_feedback, transcript_text, segments)] = ("feedback", None, None)
+        futs[pool.submit(draft_retention_email, transcript_text, segments)] = (
+            "retention", None, None
+        )
+        for fut in as_completed(futs):
+            kind, i, cr = futs[fut]
+            if kind == "crit":
+                ordered[i] = (cr, fut.result())
+            elif kind == "churn":
+                churn = fut.result()
+            elif kind == "feedback":
+                feedback = fut.result()
+            else:
+                retention_email = fut.result()
+    log.info(
+        "parallel Claude wave done in %.1fs "
+        "(%d criteria + churn + feedback + retention email, workers=%d)",
+        time.perf_counter() - t0, n, workers,
+    )
+    return ordered, churn, feedback, retention_email
+
+
 # ---------- Scoring ----------
 FRACTION = {"pass": 1.0, "partial": 0.5, "fail": 0.0, "unverified": 0.0}
 SCORE_EXCLUDED = {"not_applicable", "error"}
@@ -488,8 +623,9 @@ def main():
 
     log.info("auditing call %d (%ss, %d turns) against '%s'",
              call_id, meta.get("audio_seconds"), len(segments), rubric["name"])
-    results = [(c, evaluate_criterion(c, segments, agent, transcript_text))
-               for c in rubric["criteria"]]
+    results = evaluate_all_criteria(
+        rubric["criteria"], segments, agent, transcript_text
+    )
     rows, score, earned, possible, tally, gate_fails = score_results(results)
     grade = performance_band(score)
 

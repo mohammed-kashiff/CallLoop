@@ -34,7 +34,7 @@ DB_PATH = "callproof.db"
 RECAP_PACK_ID = os.getenv("RECAP_PACK_ID") or None
 
 AUDIO_SOURCE = "/Users/mohammed.kashif/Downloads/test1.mp3"   # only used by the CLI main()
-SEPARATION_MODE = "diarize"    # "diarize" (mono or stereo) | "channel" (true dual-channel)
+SEPARATION_MODE = "channel"    # "diarize" (mono or stereo) | "channel" (true dual-channel)
 MODEL = "pyai-hear-telephony"
 
 POLL_INTERVAL_SECONDS = 2

@@ -154,6 +154,74 @@ button { transition: background .15s ease, border-color .15s ease, color .15s ea
   color: var(--amber);
 }
 
+/* ---------- Job progress (transcribe / audit) ---------- */
+
+.job-progress {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px 16px;
+  margin: 8px 0 12px;
+}
+
+.job-progress-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.job-progress-label {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.job-progress-timer {
+  font-variant-numeric: tabular-nums;
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  color: var(--accent, #d9653a);
+  min-width: 3.5ch;
+  text-align: right;
+}
+
+.job-progress-track {
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.06);
+  overflow: hidden;
+}
+
+.job-progress-bar {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #e08a5d, #d9653a 55%, #c14f2c);
+  transition: width 0.25s ease-out;
+}
+
+.job-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.job-progress-hint {
+  line-height: 1.35;
+}
+
+.job-progress-pct {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: var(--ink-soft);
+  flex-shrink: 0;
+}
+
 /* ---------- Layout ---------- */
 
 .layout {
@@ -336,6 +404,14 @@ button { transition: background .15s ease, border-color .15s ease, color .15s ea
   font-size: 12.5px;
 }
 
+.churn-email-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  max-width: 280px;
+}
+
 .churn-email {
   background: var(--red);
   color: #fff;
@@ -347,7 +423,19 @@ button { transition: background .15s ease, border-color .15s ease, color .15s ea
   cursor: pointer;
 }
 
-.churn-email:hover { background: #9f302a; }
+.churn-email:hover:not(:disabled) { background: #9f302a; }
+
+.churn-email:disabled {
+  opacity: 0.7;
+  cursor: wait;
+}
+
+.churn-email-error {
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--red);
+  text-align: right;
+}
 
 .churn-queued {
   font-size: 12px;
@@ -537,6 +625,50 @@ button { transition: background .15s ease, border-color .15s ease, color .15s ea
 .jump:hover { background: var(--navy-soft); }
 
 /* ---------- Coaching ---------- */
+
+.coaching-block .h {
+  margin-top: 0;
+  border-top: none;
+  padding-top: 0;
+}
+
+.coaching-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 20px 0 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+}
+
+.coach-btn {
+  flex-shrink: 0;
+  border: 1px solid var(--line);
+  background: var(--panel, #fff);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 700;
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.coach-btn:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.coach-btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.coach-empty {
+  font-size: 13.5px;
+  color: var(--muted);
+  line-height: 1.45;
+  margin: 0 0 8px;
+}
 
 .coach {
   background: transparent;

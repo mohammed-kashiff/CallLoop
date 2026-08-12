@@ -13,6 +13,13 @@ function fmtTime(s) {
   return `${m}:${String(sec).padStart(2, "0")}`;
 }
 
+function fmtElapsed(totalSec) {
+  const s = Math.max(0, Math.floor(totalSec || 0));
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return `${m}:${String(sec).padStart(2, "0")}`;
+}
+
 function bandClass(grade) {
   return (
     {
@@ -24,6 +31,77 @@ function bandClass(grade) {
   );
 }
 
+/** Client-side progress + elapsed timer (no server progress stream). */
+function JobProgress({ active, phase, fromUpload }) {
+  const [elapsed, setElapsed] = useState(0);
+  const startedAt = useRef(null);
+
+  useEffect(() => {
+    if (!active) {
+      startedAt.current = null;
+      setElapsed(0);
+      return undefined;
+    }
+    if (startedAt.current == null) startedAt.current = Date.now();
+    const tick = () => {
+      setElapsed((Date.now() - startedAt.current) / 1000);
+    };
+    tick();
+    const id = setInterval(tick, 200);
+    return () => clearInterval(id);
+  }, [active]);
+
+  if (!active) return null;
+
+  // Upload→audit pipeline: transcribe 0–55%, then audit 55–95%.
+  // Audit-only (Re-run): start at 0% so it doesn't jump to mid-bar.
+  const pipelineAudit = phase === "audit" && fromUpload;
+  const phaseFloor = pipelineAudit ? 55 : 0;
+  const phaseSpan = pipelineAudit ? 40 : 90;
+  const phaseExpected = phase === "audit" ? 40 : 35;
+  const within = Math.min(
+    phaseSpan - 1,
+    phaseSpan * (1 - Math.exp(-elapsed / phaseExpected)),
+  );
+  const pct = Math.min(95, Math.round(phaseFloor + within));
+
+  const label =
+    phase === "transcribe"
+      ? "Transcribing your call…"
+      : phase === "audit"
+        ? "Auditing the call…"
+        : "Working…";
+  const hint =
+    phase === "transcribe"
+      ? "Uploading audio and waiting on PyAI Hear (often 20–40s)."
+      : "Running rubric, churn, feedback, and retention draft in parallel.";
+
+  return (
+    <div className="job-progress" aria-live="polite">
+      <div className="job-progress-head">
+        <span className="job-progress-label">{label}</span>
+        <span className="job-progress-timer" title="Elapsed time">
+          {fmtElapsed(elapsed)}
+        </span>
+      </div>
+      <div
+        className="job-progress-track"
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={pct}
+        aria-label={label}
+      >
+        <div className="job-progress-bar" style={{ width: `${pct}%` }} />
+      </div>
+      <div className="job-progress-meta">
+        <span className="job-progress-hint">{hint}</span>
+        <span className="job-progress-pct">{pct}%</span>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [calls, setCalls] = useState([]);
   const [callId, setCallId] = useState(null);
@@ -32,9 +110,14 @@ export default function App() {
   const [error, setError] = useState(null);
   const [now, setNow] = useState(0);
   const [uploading, setUploading] = useState(false);
+  const [pipelineActive, setPipelineActive] = useState(false);
+  const [jobFromUpload, setJobFromUpload] = useState(false);
   const [uploadError, setUploadError] = useState(null);
   const [dragOver, setDragOver] = useState(false);
-  const [emailQueued, setEmailQueued] = useState(false);
+  const [emailStatus, setEmailStatus] = useState(null); // null | opening | opened | error
+  const [emailMessage, setEmailMessage] = useState(null);
+  const [coachingLoading, setCoachingLoading] = useState(false);
+  const [coachingError, setCoachingError] = useState(null);
   const audioRef = useRef(null);
   const fileInputRef = useRef(null);
 
@@ -60,7 +143,10 @@ export default function App() {
   function loadAudit(id, refresh = false) {
     setLoading(true);
     setError(null);
-    setEmailQueued(false);
+    setEmailStatus(null);
+    setEmailMessage(null);
+    setCoachingError(null);
+    setCoachingLoading(false);
     if (!refresh) setAudit(null);
     fetch(`${API}/api/calls/${id}/audit${refresh ? "?refresh=true" : ""}`)
       .then((r) => {
@@ -69,12 +155,71 @@ export default function App() {
       })
       .then(setAudit)
       .catch(() => setError("Could not load the audit for this call."))
-      .finally(() => setLoading(false));
+      .finally(() => {
+        setLoading(false);
+        setPipelineActive(false);
+        setJobFromUpload(false);
+      });
   }
 
   useEffect(() => {
     if (callId != null) loadAudit(callId);
   }, [callId]);
+
+  async function loadCoaching() {
+    if (callId == null || coachingLoading) return;
+    setCoachingLoading(true);
+    setCoachingError(null);
+    try {
+      const r = await fetch(`${API}/api/calls/${callId}/coaching`, { method: "POST" });
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        const detail = typeof d.detail === "string" ? d.detail : "Could not generate coaching.";
+        throw new Error(detail);
+      }
+      const data = await r.json();
+      setAudit((prev) => (prev ? { ...prev, coaching: data.coaching || [] } : prev));
+    } catch (e) {
+      setCoachingError(e.message || "Could not generate coaching.");
+    } finally {
+      setCoachingLoading(false);
+    }
+  }
+
+  async function openStakeholderGmail() {
+    if (callId == null || emailStatus === "opening") return;
+    setEmailStatus("opening");
+    setEmailMessage(null);
+    try {
+      const r = await fetch(
+        `${API}/api/calls/${callId}/stakeholder-email/compose`,
+      );
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        const detail =
+          typeof d.detail === "string"
+            ? d.detail
+            : "Could not open Gmail compose.";
+        throw new Error(detail);
+      }
+      if (!d.gmail_url) throw new Error("Missing Gmail compose link.");
+      const win = window.open(d.gmail_url, "_blank", "noopener,noreferrer");
+      if (!win) {
+        throw new Error(
+          "Popup blocked. Allow popups for this site, then try again.",
+        );
+      }
+      setEmailStatus("opened");
+      setEmailMessage(
+        d.to
+          ? `Gmail compose opened (To: ${d.to}). Review and send.`
+          : "Gmail compose opened. Add the stakeholder address, review, and send.",
+      );
+    } catch (e) {
+      setEmailStatus("error");
+      setEmailMessage(e.message || "Could not open Gmail compose.");
+    }
+  }
 
   async function handleFiles(files) {
     const f = files && files[0];
@@ -87,6 +232,8 @@ export default function App() {
       );
       return;
     }
+    setJobFromUpload(true);
+    setPipelineActive(true);
     setUploading(true);
     try {
       const fd = new FormData();
@@ -100,8 +247,11 @@ export default function App() {
       const { call_id } = await r.json();
       await refreshCalls();
       setCallId(call_id);
+      // Keep pipelineActive true until audit finishes so the timer doesn't reset.
     } catch (e) {
       setUploadError(e.message || "Upload failed");
+      setPipelineActive(false);
+      setJobFromUpload(false);
     } finally {
       setUploading(false);
     }
@@ -135,6 +285,21 @@ export default function App() {
   const callRecap = audit?.recap ?? null;
   const recapStatus = callRecap?.status ?? null;
   const recapItems = callRecap?.action_items ?? [];
+  const retentionEmail = audit?.retention_email ?? null;
+  const retentionReady = retentionEmail?.status === "ok" && !!retentionEmail?.body;
+
+  const coaching = audit?.coaching ?? [];
+  const weakCount =
+    audit?.findings?.filter((f) =>
+      ["fail", "partial", "unverified"].includes(f.verdict),
+    ).length ?? 0;
+
+  const jobActive = uploading || loading || pipelineActive;
+  const jobPhase = uploading
+    ? "transcribe"
+    : loading || pipelineActive
+      ? "audit"
+      : null;
 
   return (
     <div className="app">
@@ -149,6 +314,7 @@ export default function App() {
             className="call-select"
             value={callId ?? ""}
             onChange={(e) => setCallId(Number(e.target.value))}
+            disabled={jobActive}
           >
             {calls.map((c) => (
               <option key={c.id} value={c.id}>
@@ -177,7 +343,7 @@ export default function App() {
           onChange={(e) => handleFiles(e.target.files)}
         />
         {uploading ? (
-          <span>⏳ Transcribing your call… this can take 20–40 seconds</span>
+          <span>Transcribing in progress — see timer below</span>
         ) : (
           <span>
             Drag a call recording here, or click to choose a file (max {MAX_UPLOAD_MB} MB)
@@ -187,9 +353,11 @@ export default function App() {
       {uploadError && <div className="banner error">{uploadError}</div>}
 
       {error && <div className="banner error">{error}</div>}
-      {loading && (
-        <div className="banner">Auditing the call… (the first run calls the model)</div>
-      )}
+      <JobProgress
+        active={jobActive}
+        phase={jobPhase}
+        fromUpload={jobFromUpload}
+      />
 
       {audit && (
         <main className="layout">
@@ -228,16 +396,30 @@ export default function App() {
                     <>Churn risk: <b>{churnRisk}</b></>
                   )}
                 </span>
-                {(churnRisk === "high" || churnRisk === "medium") &&
-                  (emailQueued ? (
-                    <span className="churn-queued">
-                      Stakeholder alert queued (email delivery not yet configured)
-                    </span>
-                  ) : (
-                    <button className="churn-email" onClick={() => setEmailQueued(true)}>
-                      Send email to stakeholder
+                {(churnRisk === "high" || churnRisk === "medium") && (
+                  <div className="churn-email-wrap">
+                    <button
+                      className="churn-email"
+                      onClick={openStakeholderGmail}
+                      disabled={emailStatus === "opening"}
+                    >
+                      {emailStatus === "opening"
+                        ? "Opening Gmail…"
+                        : "Send email to stakeholder"}
                     </button>
-                  ))}
+                    {retentionReady && emailStatus !== "error" && (
+                      <span className="churn-queued">
+                        Retention email draft ready (from transcript)
+                      </span>
+                    )}
+                    {emailStatus === "opened" && emailMessage && (
+                      <span className="churn-queued">{emailMessage}</span>
+                    )}
+                    {emailStatus === "error" && emailMessage && (
+                      <div className="churn-email-error">{emailMessage}</div>
+                    )}
+                  </div>
+                )}
               </div>
 
               {churnRisk === "none" ? (
@@ -340,17 +522,39 @@ export default function App() {
               );
             })}
 
-            {audit.coaching.length > 0 && (
-              <>
+            <section className="coaching-block">
+              <div className="coaching-head">
                 <h2 className="h">Coaching</h2>
-                {audit.coaching.map((c, i) => (
+                {weakCount > 0 && (
+                  <button
+                    className="coach-btn"
+                    onClick={loadCoaching}
+                    disabled={coachingLoading}
+                  >
+                    {coachingLoading
+                      ? "Generating…"
+                      : coaching.length > 0
+                        ? "Regenerate coaching"
+                        : "Generate coaching tips"}
+                  </button>
+                )}
+              </div>
+              {coachingError && <div className="banner error">{coachingError}</div>}
+              {weakCount === 0 ? (
+                <p className="coach-empty">No weak areas — coaching not needed for this call.</p>
+              ) : coaching.length === 0 && !coachingLoading ? (
+                <p className="coach-empty">
+                  Coaching is optional and runs only when you ask — press the button to generate tips.
+                </p>
+              ) : (
+                coaching.map((c, i) => (
                   <div className="coach" key={i}>
                     <div className="coach-crit">{c.criterion}</div>
                     <div className="coach-tip">{c.tip}</div>
                   </div>
-                ))}
-              </>
-            )}
+                ))
+              )}
+            </section>
 
             {audit.feedback && (
               <section className="customer-feedback">
