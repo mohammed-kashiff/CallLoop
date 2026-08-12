@@ -16,7 +16,10 @@ import time
 import httpx
 from dotenv import load_dotenv
 
+import applog
+
 load_dotenv()
+applog.setup_logging()
 
 log = logging.getLogger("callproof.recap")
 
@@ -28,6 +31,12 @@ RECAP_POLL_ATTEMPTS = 45  # ~90s
 
 HEADERS = {"Authorization": f"Bearer {PYAI_API_KEY}"} if PYAI_API_KEY else {}
 
+SANDBOX_RECAP_ERROR = (
+    "Recap is unavailable on a sandbox PyAI key. "
+    "Create a live API key at https://console.pyai.com and set PYAI_API_KEY "
+    "in your .env, then restart and re-run the audit."
+)
+
 
 def set_api_key(api_key: str):
     """Inject / rotate the PyAI key at runtime (used by api.py sandbox mint)."""
@@ -38,6 +47,19 @@ def set_api_key(api_key: str):
     PYAI_API_KEY = key
     HEADERS = {"Authorization": f"Bearer {key}"}
     os.environ["PYAI_API_KEY"] = key
+
+
+def is_sandbox_key(api_key: str | None = None) -> bool:
+    key = (api_key if api_key is not None else PYAI_API_KEY) or ""
+    return key.startswith("pyai_test_")
+
+
+def sandbox_recap_unavailable():
+    return {
+        "status": "unavailable",
+        "reason": "sandbox_key",
+        "error": SANDBOX_RECAP_ERROR,
+    }
 
 
 def pyai_call_id_for(local_call_id: int, stored: str | None = None) -> str:
@@ -168,22 +190,46 @@ def poll_recap(pyai_call_id: str):
 def ensure_recap(local_call_id, segments, agent_speaker, audio_seconds=None, stored_pyai_id=None):
     """Fetch Recap for this call, triggering from utterances when needed."""
     if not PYAI_API_KEY:
+        applog.event(
+            log, "recap_failure", level=logging.WARNING,
+            call_id=local_call_id, error="PYAI_API_KEY not configured",
+        )
         return {"status": "unavailable", "error": "PYAI_API_KEY not configured."}
+
+    # Sandbox keys do not include Recap scopes — fail fast with a clear message.
+    if is_sandbox_key():
+        applog.event(
+            log, "recap_failure", level=logging.WARNING,
+            call_id=local_call_id, error="sandbox_key",
+        )
+        return sandbox_recap_unavailable()
 
     pyai_id = pyai_call_id_for(local_call_id, stored_pyai_id)
     code, existing = get_recap(pyai_id)
     if code == 200 and isinstance(existing, dict):
         if existing.get("status") == "complete":
             log.info("recap HIT for %s", pyai_id)
-            return _normalize(existing)
+            result = _normalize(existing)
+            applog.event(
+                log, "recap_success",
+                call_id=local_call_id, pyai_call_id=pyai_id, source="cache",
+            )
+            return result
         if existing.get("status") in ("pending", "processing"):
-            return poll_recap(pyai_id)
+            result = poll_recap(pyai_id)
+            _log_recap_outcome(local_call_id, pyai_id, result, source="poll")
+            return result
         if existing.get("status") == "failed":
             # Retry once with a fresh utterance submit
             log.info("recap prior failed for %s; re-triggering", pyai_id)
 
     utterances = segments_to_utterances(segments, agent_speaker)
     if not utterances:
+        applog.event(
+            log, "recap_failure", level=logging.ERROR,
+            call_id=local_call_id, pyai_call_id=pyai_id,
+            error="No utterances available for Recap",
+        )
         return {"status": "error", "error": "No utterances available for Recap."}
 
     t_code, t_body = trigger_recap(pyai_id, utterances, audio_seconds)
@@ -197,6 +243,19 @@ def ensure_recap(local_call_id, segments, agent_speaker, audio_seconds=None, sto
                 msg = err
             msg = msg or t_body.get("detail") or t_body.get("title")
         log.warning("recap trigger failed %s: %s", t_code, t_body)
+        # Scope/auth failures on a test key → same clear sandbox guidance.
+        if t_code in (401, 403) and is_sandbox_key():
+            applog.event(
+                log, "recap_failure", level=logging.WARNING,
+                call_id=local_call_id, pyai_call_id=pyai_id,
+                http_status=t_code, error="sandbox_key",
+            )
+            return sandbox_recap_unavailable()
+        applog.event(
+            log, "recap_failure", level=logging.ERROR,
+            call_id=local_call_id, pyai_call_id=pyai_id,
+            http_status=t_code, error=msg or f"trigger_failed_{t_code}",
+        )
         if t_code in (401, 403, 402):
             return {
                 "status": "unavailable",
@@ -205,4 +264,21 @@ def ensure_recap(local_call_id, segments, agent_speaker, audio_seconds=None, sto
         return {"status": "error", "error": msg or f"Recap trigger failed ({t_code})."}
 
     log.info("recap triggered for %s (%s)", pyai_id, t_code)
-    return poll_recap(pyai_id)
+    result = poll_recap(pyai_id)
+    _log_recap_outcome(local_call_id, pyai_id, result, source="trigger")
+    return result
+
+
+def _log_recap_outcome(local_call_id, pyai_id, result, source):
+    status = (result or {}).get("status")
+    if status == "ok":
+        applog.event(
+            log, "recap_success",
+            call_id=local_call_id, pyai_call_id=pyai_id, source=source,
+        )
+    else:
+        applog.event(
+            log, "recap_failure", level=logging.WARNING,
+            call_id=local_call_id, pyai_call_id=pyai_id, source=source,
+            status=status, error=(result or {}).get("error"),
+        )

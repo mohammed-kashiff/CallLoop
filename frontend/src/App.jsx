@@ -478,6 +478,20 @@ export default function App() {
                   <p className="recap-empty">
                     {callRecap.error || "Recap still processing. Re-run shortly."}
                   </p>
+                ) : callRecap.reason === "sandbox_key" ||
+                  /sandbox/i.test(callRecap.error || "") ? (
+                  <p className="recap-empty recap-sandbox">
+                    Recap is unavailable on a sandbox PyAI key. Visit{" "}
+                    <a
+                      href="https://console.pyai.com"
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      console.pyai.com
+                    </a>{" "}
+                    to create a live API key, add it to <code>.env</code> as{" "}
+                    <code>PYAI_API_KEY</code>, restart the API, then re-run the audit.
+                  </p>
                 ) : (
                   <p className="recap-empty">
                     {callRecap.error || "Call recap is unavailable for this call."}

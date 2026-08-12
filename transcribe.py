@@ -19,7 +19,10 @@ import uuid
 import httpx
 from dotenv import load_dotenv
 
+import applog
+
 load_dotenv()
+applog.setup_logging()
 
 logging.basicConfig(
     level=logging.INFO,

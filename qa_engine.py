@@ -26,8 +26,10 @@ import httpx
 from dotenv import load_dotenv
 
 import rules
+import applog
 
 load_dotenv()
+applog.setup_logging()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -209,8 +211,13 @@ def call_claude(prompt):
     """POST to Claude with temperature=0. Retries with backoff on 429/5xx.
     Logs every failed attempt. Raises RuntimeError only if all attempts fail."""
     if not ANTHROPIC_API_KEY:
+        applog.event(
+            log, "claude_failure", level=logging.ERROR,
+            error="ANTHROPIC_API_KEY is not set",
+        )
         raise RuntimeError("ANTHROPIC_API_KEY is not set")
     last_err = None
+    started = time.perf_counter()
     for attempt in range(1, MAX_HTTP_RETRIES + 1):
         try:
             resp = httpx.post(
@@ -226,8 +233,15 @@ def call_claude(prompt):
             )
             if resp.status_code == 200:
                 data = resp.json()
-                return "".join(b.get("text", "") for b in data.get("content", [])
+                text = "".join(b.get("text", "") for b in data.get("content", [])
                                if b.get("type") == "text")
+                applog.event(
+                    log, "claude_success",
+                    attempt=attempt,
+                    duration_ms=round((time.perf_counter() - started) * 1000, 1),
+                    chars=len(text),
+                )
+                return text
             last_err = f"{resp.status_code}: {resp.text[:300]}"
             log.warning("claude attempt %d/%d -> %s", attempt, MAX_HTTP_RETRIES, last_err)
             if resp.status_code == 429 or resp.status_code >= 500:
@@ -238,6 +252,12 @@ def call_claude(prompt):
             last_err = f"{type(e).__name__}: {e}"
             log.warning("claude attempt %d/%d exception: %s", attempt, MAX_HTTP_RETRIES, last_err)
             time.sleep(1)
+    applog.event(
+        log, "claude_failure", level=logging.ERROR,
+        attempts=MAX_HTTP_RETRIES,
+        duration_ms=round((time.perf_counter() - started) * 1000, 1),
+        error=last_err,
+    )
     log.error("claude call failed after %d attempts: %s", MAX_HTTP_RETRIES, last_err)
     raise RuntimeError(f"Claude call failed: {last_err}")
 

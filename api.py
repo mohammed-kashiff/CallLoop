@@ -19,16 +19,20 @@ import json
 import hashlib
 import logging
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
+import applog
+
 load_dotenv()
+applog.setup_logging()
 
 import qa_engine as qa
 import transcribe
@@ -57,6 +61,38 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_http(request: Request, call_next):
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception as e:  # noqa: BLE001
+        duration_ms = (time.perf_counter() - started) * 1000
+        applog.event(
+            log, "http_error",
+            level=logging.ERROR,
+            method=request.method,
+            path=request.url.path,
+            duration_ms=round(duration_ms, 1),
+            error=f"{type(e).__name__}: {e}",
+        )
+        raise
+
+    duration_ms = (time.perf_counter() - started) * 1000
+    status = response.status_code
+    fields = {
+        "method": request.method,
+        "path": request.url.path,
+        "status": status,
+        "duration_ms": round(duration_ms, 1),
+    }
+    if status >= 400:
+        applog.event(log, "http_error", level=logging.ERROR, **fields)
+    else:
+        applog.event(log, "http_request", **fields)
+    return response
 
 
 def _conn():
@@ -234,17 +270,28 @@ def _rubric_hash():
 
 
 def analyze_call(call_id, agent_override=None):
+    started = time.perf_counter()
+    applog.event(log, "audit_started", call_id=call_id)
+
     with _conn() as c:
         exists = c.execute(
             "SELECT 1 FROM calls WHERE id=? AND status='completed'", (call_id,)
         ).fetchone()
     if not exists:
+        applog.event(
+            log, "audit_failed", level=logging.ERROR,
+            call_id=call_id, error="call_not_found_or_incomplete",
+        )
         raise HTTPException(
             status_code=404, detail=f"No completed call with id {call_id}"
         )
 
     call_id, meta, segments = qa.load_call(call_id)
     if not segments:
+        applog.event(
+            log, "audit_failed", level=logging.ERROR,
+            call_id=call_id, error="no_segments",
+        )
         raise HTTPException(
             status_code=422, detail=f"Call {call_id} has no segments"
         )
@@ -276,6 +323,10 @@ def analyze_call(call_id, agent_override=None):
             call_recap = recap_f.result()
         except Exception as e:  # noqa: BLE001
             log.error("recap failed for call %d: %s", call_id, e)
+            applog.event(
+                log, "recap_failure", level=logging.ERROR,
+                call_id=call_id, error=str(e),
+            )
             call_recap = {"status": "error", "error": str(e)}
 
     _rows, score, _e, _p, tally, gate_fails = qa.score_results(results)
@@ -293,6 +344,16 @@ def analyze_call(call_id, agent_override=None):
         }
         for cr, res in results
     ]
+
+    duration_ms = (time.perf_counter() - started) * 1000
+    applog.event(
+        log, "audit_completed",
+        call_id=call_id,
+        score=score,
+        grade=grade,
+        duration_ms=round(duration_ms, 1),
+        recap_status=(call_recap or {}).get("status"),
+    )
 
     return {
         "call_id": call_id, "audio_seconds": meta.get("audio_seconds"),
@@ -364,13 +425,19 @@ def get_audit(call_id: int, refresh: bool = False):
             ).fetchone()
         if row and row["rubric_hash"] == rh:
             cached = json.loads(row["audit_json"])
+            applog.event(
+                log, "audit_cache",
+                result="HIT", call_id=call_id, score=cached.get("score"),
+            )
             log.info(
                 "cache HIT  call %d (score %s) - returning stored audit",
                 call_id, cached.get("score"),
             )
             return cached
+        applog.event(log, "audit_cache", result="MISS", call_id=call_id)
         log.info("cache MISS  call %d - computing fresh audit", call_id)
     else:
+        applog.event(log, "audit_cache", result="BYPASS", call_id=call_id)
         log.info("cache BYPASS (refresh) call %d - computing fresh audit", call_id)
     audit, _rh = _load_or_compute_audit(call_id, refresh=True)
     log.info("cached audit for call %d (score %s)", call_id, audit["score"])
@@ -455,12 +522,26 @@ def upload(file: UploadFile = File(...)):
     if not data:
         raise HTTPException(status_code=400, detail="The uploaded file was empty.")
     size = len(data)
-    log.info("upload received: %s (%.2f MB)", file.filename, size / (1024 * 1024))
+    size_mb = size / (1024 * 1024)
+    applog.event(
+        log, "upload_received",
+        filename=file.filename or "unknown",
+        size_bytes=size,
+        size_mb=round(size_mb, 3),
+    )
+    log.info("upload received: %s (%.2f MB)", file.filename, size_mb)
     if size > MAX_UPLOAD_BYTES:
+        applog.event(
+            log, "upload_rejected", level=logging.ERROR,
+            filename=file.filename or "unknown",
+            size_bytes=size,
+            size_mb=round(size_mb, 3),
+            error="file_too_large",
+        )
         raise HTTPException(
             status_code=413,
             detail=(
-                f"File too large for transcription ({size / (1024 * 1024):.1f} MB). "
+                f"File too large for transcription ({size_mb:.1f} MB). "
                 f"Maximum is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB."
             ),
         )
@@ -476,6 +557,10 @@ def upload(file: UploadFile = File(...)):
         existing = transcribe.find_existing_call(conn, identity)
         if existing:
             call_id = existing[0]
+            applog.event(
+                log, "transcription_success",
+                call_id=call_id, deduped=True, size_bytes=size,
+            )
             log.info(
                 "upload deduped to existing call %d (no re-transcription)", call_id
             )
@@ -485,6 +570,15 @@ def upload(file: UploadFile = File(...)):
             result = transcribe.poll_job(job_id)
             call_id = transcribe.save_transcript(
                 conn, identity, job_id, result, pyai_call_id=pyai_id
+            )
+            applog.event(
+                log, "transcription_success",
+                call_id=call_id,
+                pyai_call_id=pyai_id,
+                job_id=job_id,
+                segments=len(result.get("segments") or []),
+                size_bytes=size,
+                deduped=False,
             )
             log.info(
                 "transcription complete -> new call %d (pyai_call_id=%s)",
@@ -496,6 +590,12 @@ def upload(file: UploadFile = File(...)):
         raise
     except (Exception, SystemExit) as e:
         msg = str(e)
+        applog.event(
+            log, "transcription_failure", level=logging.ERROR,
+            filename=file.filename or "unknown",
+            size_bytes=size,
+            error=msg,
+        )
         log.error("upload/transcription failed: %s", msg)
         if "daily_cap_exceeded" in msg:
             raise HTTPException(

@@ -501,6 +501,26 @@ button { transition: background .15s ease, border-color .15s ease, color .15s ea
   color: var(--muted);
 }
 
+.recap-sandbox {
+  line-height: 1.5;
+  max-width: 42rem;
+}
+
+.recap-sandbox a {
+  color: var(--navy, #17243a);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.recap-sandbox code {
+  font-size: 12px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--surface-soft, #f5f5f5);
+  border: 1px solid var(--line, #e5e5e5);
+}
+
 /* ---------- Findings (document rows) ---------- */
 
 .finding {

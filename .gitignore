@@ -10,6 +10,9 @@ __pycache__/
 callproof.db
 audio/
 
+# local runtime logs (rotating file under logs/)
+logs/
+
 # node / frontend build
 node_modules/
 frontend/node_modules/
