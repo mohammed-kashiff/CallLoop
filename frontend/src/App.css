@@ -229,6 +229,34 @@ button { transition: background .15s ease, border-color .15s ease, color .15s ea
   background: var(--accent-soft);
 }
 
+.calls-library-table tr.active td {
+  border-bottom-color: transparent;
+}
+
+.library-audit-row td {
+  padding: 0 0 14px;
+  background: #faf7f2;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.library-audit-panel {
+  padding: 12px 10px 4px;
+  border-top: 1px dashed #e0d5c8;
+}
+
+.library-audit-panel .layout {
+  margin-top: 0;
+}
+
+.library-audit-loading {
+  margin: 0;
+  padding: 14px 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
 .calls-library-table .mono {
   font-variant-numeric: tabular-nums;
   font-weight: 700;

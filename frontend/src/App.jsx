@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, Fragment } from "react";
 import "./App.css";
 
 const API = "http://localhost:8000";
@@ -406,243 +406,8 @@ export default function App() {
     bulkJobs.filter((j) => j.callId != null && j.score != null).map((j) => [j.callId, j.score]),
   );
 
-  return (
-    <div className="app">
-      <header className="topbar">
-        <div className="brand">
-          <span className="logo">◆</span>
-          <span className="brand-name">CallProof</span>
-          <span className="tagline">AI Call Quality Auditor</span>
-        </div>
-        <div className="topbar-actions">
-          <button
-            type="button"
-            className={`library-toggle ${showLibrary ? "on" : ""}`}
-            onClick={() => setShowLibrary((v) => !v)}
-          >
-            {showLibrary ? "Hide library" : "Calls library"}
-          </button>
-          {calls.filter((c) => c.status === "completed" || !c.status).length > 0 && (
-            <label className="call-select-wrap">
-              <span className="call-select-label">View audit</span>
-              <select
-                className="call-select"
-                value={callId ?? ""}
-                onChange={(e) => setCallId(Number(e.target.value))}
-                disabled={jobActive}
-              >
-                {calls
-                  .filter((c) => c.status === "completed" || !c.status)
-                  .map((c) => {
-                  const scored = scoreByCallId[c.id] ?? c.score;
-                  const scoreLabel =
-                    scored != null
-                      ? ` — score ${scored}`
-                      : callId === c.id && audit?.score != null
-                        ? ` — score ${audit.score}`
-                        : "";
-                  return (
-                    <option key={c.id} value={c.id}>
-                      Call #{c.id} — {fmtTime(c.audio_seconds)}
-                      {scoreLabel}
-                    </option>
-                  );
-                })}
-              </select>
-            </label>
-          )}
-        </div>
-      </header>
-
-      {showLibrary && (
-        <section className="calls-library" aria-label="Stored calls library">
-          <div className="calls-library-head">
-            <div>
-              <h2 className="calls-library-title">Stored calls</h2>
-              <p className="calls-library-sub">
-                From local SQLite (<code>callproof.db</code>) — {calls.length} call
-                {calls.length === 1 ? "" : "s"}
-              </p>
-            </div>
-            <button
-              type="button"
-              className="library-refresh"
-              disabled={jobActive}
-              onClick={() => refreshCalls().catch(() => setError("Could not refresh calls."))}
-            >
-              Refresh
-            </button>
-          </div>
-          {calls.length === 0 ? (
-            <p className="calls-library-empty">No calls stored yet. Upload a recording to begin.</p>
-          ) : (
-            <div className="calls-library-table-wrap">
-              <table className="calls-library-table">
-                <thead>
-                  <tr>
-                    <th>Call</th>
-                    <th>Status</th>
-                    <th>Duration</th>
-                    <th>Speakers</th>
-                    <th>Segments</th>
-                    <th>Score</th>
-                    <th>Stored</th>
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
-                  {calls.map((c) => {
-                    const active = callId === c.id;
-                    return (
-                      <tr key={c.id} className={active ? "active" : ""}>
-                        <td className="mono">#{c.id}</td>
-                        <td>
-                          <span className={`lib-pill status-${c.status || "unknown"}`}>
-                            {c.status || "unknown"}
-                          </span>
-                        </td>
-                        <td>{fmtTime(c.audio_seconds)}</td>
-                        <td>{c.speakers ?? "—"}</td>
-                        <td>{c.segment_count ?? "—"}</td>
-                        <td>
-                          {c.has_audit ? (
-                            <span title={c.audit_fresh ? "Audit cache is current" : "Rubric changed since this score was cached"}>
-                              {c.score != null ? c.score : "—"}
-                              {c.grade ? ` · ${c.grade}` : ""}
-                              {!c.audit_fresh && c.has_audit ? " *" : ""}
-                            </span>
-                          ) : (
-                            <span className="muted">not audited</span>
-                          )}
-                        </td>
-                        <td className="muted small">
-                          {(c.created_at || "").replace("T", " ").slice(0, 19) || "—"}
-                        </td>
-                        <td>
-                          <button
-                            type="button"
-                            className="lib-open"
-                            disabled={jobActive || (active && !!audit)}
-                            onClick={() => {
-                              setCallId(c.id);
-                              setShowLibrary(false);
-                            }}
-                          >
-                            {active ? "Viewing" : "Open audit"}
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-          <p className="calls-library-hint">
-            * Score marked with an asterisk may be stale after a rubric change
-            (cached audit was scored under an older rubric).
-          </p>
-        </section>
-      )}
-
-      <div
-        className={`dropzone ${dragOver ? "over" : ""} ${jobActive ? "busy" : ""}`}
-        onDragOver={(e) => {
-          e.preventDefault();
-          if (!jobActive) setDragOver(true);
-        }}
-        onDragLeave={() => setDragOver(false)}
-        onDrop={onDrop}
-        onClick={() => !jobActive && fileInputRef.current && fileInputRef.current.click()}
-      >
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="audio/*"
-          multiple
-          hidden
-          onChange={(e) => handleFiles(e.target.files)}
-        />
-        {bulkRunning ? (
-          <span>
-            Importing batch — {bulkDoneCount + bulkFailedCount} / {bulkJobs.length} finished
-          </span>
-        ) : uploading ? (
-          <span>Transcribing in progress — see timer below</span>
-        ) : (
-          <span>
-            Drag up to {MAX_BULK_FILES} call recordings here, or click to choose
-            files (max {MAX_UPLOAD_MB} MB each)
-          </span>
-        )}
-      </div>
-      {bulkNote && <div className="banner">{bulkNote}</div>}
-      {uploadError && <div className="banner error">{uploadError}</div>}
-
-      {bulkJobs.length > 0 && (
-        <section className="bulk-progress" aria-live="polite">
-          <div className="bulk-progress-head">
-            <h2 className="bulk-progress-title">Batch import</h2>
-            <span className="bulk-progress-count">
-              {bulkDoneCount} done
-              {bulkFailedCount ? ` · ${bulkFailedCount} failed` : ""}
-              {" · "}
-              {bulkJobs.length} total
-            </span>
-          </div>
-          <ul className="bulk-job-list">
-            {bulkJobs.map((j) => (
-              <li key={j.key} className={`bulk-job status-${j.status}`}>
-                <div className="bulk-job-main">
-                  <span className="bulk-job-name" title={j.name}>
-                    {j.name}
-                  </span>
-                  <span className="bulk-job-status">
-                    {j.status === "queued" && "Queued"}
-                    {j.status === "uploading" && "Uploading / transcribing…"}
-                    {j.status === "auditing" && "Auditing…"}
-                    {j.status === "done" && (
-                      <>
-                        Done
-                        {j.callId != null && ` · Call #${j.callId}`}
-                        {j.score != null && ` · score ${j.score}`}
-                      </>
-                    )}
-                    {j.status === "failed" && "Failed"}
-                  </span>
-                </div>
-                <div className="bulk-job-meta">
-                  <span>{j.sizeMb} MB</span>
-                  {j.status === "done" && j.callId != null && (
-                    <button
-                      type="button"
-                      className="bulk-job-view"
-                      disabled={jobActive || callId === j.callId}
-                      onClick={() => setCallId(j.callId)}
-                    >
-                      View audit
-                    </button>
-                  )}
-                </div>
-                {j.error && <div className="bulk-job-error">{j.error}</div>}
-              </li>
-            ))}
-          </ul>
-          <p className="bulk-progress-hint">
-            Use the <b>View audit</b> dropdown above to switch between completed calls.
-          </p>
-        </section>
-      )}
-
-      {error && <div className="banner error">{error}</div>}
-      <JobProgress
-        active={jobActive}
-        phase={jobPhase}
-        fromUpload={jobFromUpload}
-      />
-
-      {audit && (
-        <main className="layout">
+  const auditMain = audit ? (
+    <main className="layout">
           <section className="col-left">
             <div className={`score-card ${bandClass(audit.grade)}`}>
               <div className="score-num">{audit.score}</div>
@@ -966,7 +731,271 @@ export default function App() {
             </div>
           </section>
         </main>
+  ) : null;
+
+  return (
+    <div className="app">
+      <header className="topbar">
+        <div className="brand">
+          <span className="logo">◆</span>
+          <span className="brand-name">CallProof</span>
+          <span className="tagline">AI Call Quality Auditor</span>
+        </div>
+        <div className="topbar-actions">
+          <button
+            type="button"
+            className={`library-toggle ${showLibrary ? "on" : ""}`}
+            onClick={() => setShowLibrary((v) => !v)}
+          >
+            {showLibrary ? "Hide library" : "Calls library"}
+          </button>
+          {calls.filter((c) => c.status === "completed" || !c.status).length > 0 && (
+            <label className="call-select-wrap">
+              <span className="call-select-label">View audit</span>
+              <select
+                className="call-select"
+                value={callId ?? ""}
+                onChange={(e) => setCallId(Number(e.target.value))}
+                disabled={jobActive}
+              >
+                {calls
+                  .filter((c) => c.status === "completed" || !c.status)
+                  .map((c) => {
+                  const scored = scoreByCallId[c.id] ?? c.score;
+                  const scoreLabel =
+                    scored != null
+                      ? ` — score ${scored}`
+                      : callId === c.id && audit?.score != null
+                        ? ` — score ${audit.score}`
+                        : "";
+                  return (
+                    <option key={c.id} value={c.id}>
+                      Call #{c.id} — {fmtTime(c.audio_seconds)}
+                      {scoreLabel}
+                    </option>
+                  );
+                })}
+              </select>
+            </label>
+          )}
+        </div>
+      </header>
+
+      {showLibrary && (
+        <section className="calls-library" aria-label="Stored calls library">
+          <div className="calls-library-head">
+            <div>
+              <h2 className="calls-library-title">Stored calls</h2>
+              <p className="calls-library-sub">
+                From local SQLite (<code>callproof.db</code>) — {calls.length} call
+                {calls.length === 1 ? "" : "s"}
+              </p>
+            </div>
+            <button
+              type="button"
+              className="library-refresh"
+              disabled={jobActive}
+              onClick={() => refreshCalls().catch(() => setError("Could not refresh calls."))}
+            >
+              Refresh
+            </button>
+          </div>
+          {calls.length === 0 ? (
+            <p className="calls-library-empty">No calls stored yet. Upload a recording to begin.</p>
+          ) : (
+            <div className="calls-library-table-wrap">
+              <table className="calls-library-table">
+                <thead>
+                  <tr>
+                    <th>Call</th>
+                    <th>Status</th>
+                    <th>Duration</th>
+                    <th>Speakers</th>
+                    <th>Segments</th>
+                    <th>Score</th>
+                    <th>Stored</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {calls.map((c) => {
+                    const active = callId === c.id;
+                    return (
+                    <Fragment key={c.id}>
+                      <tr
+                        className={active ? "active" : ""}
+                        onClick={() => {
+                          if (!jobActive) setCallId(c.id);
+                        }}
+                        style={{ cursor: jobActive ? "default" : "pointer" }}
+                      >
+                        <td className="mono">#{c.id}</td>
+                        <td>
+                          <span className={`lib-pill status-${c.status || "unknown"}`}>
+                            {c.status || "unknown"}
+                          </span>
+                        </td>
+                        <td>{fmtTime(c.audio_seconds)}</td>
+                        <td>{c.speakers ?? "—"}</td>
+                        <td>{c.segment_count ?? "—"}</td>
+                        <td>
+                          {c.has_audit ? (
+                            <span title={c.audit_fresh ? "Audit cache is current" : "Rubric changed since this score was cached"}>
+                              {c.score != null ? c.score : "—"}
+                              {c.grade ? ` · ${c.grade}` : ""}
+                              {!c.audit_fresh && c.has_audit ? " *" : ""}
+                            </span>
+                          ) : (
+                            <span className="muted">not audited</span>
+                          )}
+                        </td>
+                        <td className="muted small">
+                          {(c.created_at || "").replace("T", " ").slice(0, 19) || "—"}
+                        </td>
+                        <td>
+                          <button
+                            type="button"
+                            className="lib-open"
+                            disabled={jobActive}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setCallId(c.id);
+                            }}
+                          >
+                            {active && audit && audit.call_id === c.id
+                              ? "Viewing"
+                              : active && loading
+                                ? "Loading…"
+                                : "Open audit"}
+                          </button>
+                        </td>
+                      </tr>
+                      {active && (
+                        <tr key={`${c.id}-audit`} className="library-audit-row">
+                          <td colSpan={8}>
+                            {loading && !audit && (
+                              <p className="library-audit-loading">Loading audit…</p>
+                            )}
+                            {error && callId === c.id && (
+                              <div className="banner error">{error}</div>
+                            )}
+                            {audit && audit.call_id === c.id && (
+                              <div className="library-audit-panel">{auditMain}</div>
+                            )}
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <p className="calls-library-hint">
+            * Score marked with an asterisk may be stale after a rubric change
+            (cached audit was scored under an older rubric).
+          </p>
+        </section>
       )}
+
+      <div
+        className={`dropzone ${dragOver ? "over" : ""} ${jobActive ? "busy" : ""}`}
+        onDragOver={(e) => {
+          e.preventDefault();
+          if (!jobActive) setDragOver(true);
+        }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={onDrop}
+        onClick={() => !jobActive && fileInputRef.current && fileInputRef.current.click()}
+      >
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="audio/*"
+          multiple
+          hidden
+          onChange={(e) => handleFiles(e.target.files)}
+        />
+        {bulkRunning ? (
+          <span>
+            Importing batch — {bulkDoneCount + bulkFailedCount} / {bulkJobs.length} finished
+          </span>
+        ) : uploading ? (
+          <span>Transcribing in progress — see timer below</span>
+        ) : (
+          <span>
+            Drag up to {MAX_BULK_FILES} call recordings here, or click to choose
+            files (max {MAX_UPLOAD_MB} MB each)
+          </span>
+        )}
+      </div>
+      {bulkNote && <div className="banner">{bulkNote}</div>}
+      {uploadError && <div className="banner error">{uploadError}</div>}
+
+      {bulkJobs.length > 0 && (
+        <section className="bulk-progress" aria-live="polite">
+          <div className="bulk-progress-head">
+            <h2 className="bulk-progress-title">Batch import</h2>
+            <span className="bulk-progress-count">
+              {bulkDoneCount} done
+              {bulkFailedCount ? ` · ${bulkFailedCount} failed` : ""}
+              {" · "}
+              {bulkJobs.length} total
+            </span>
+          </div>
+          <ul className="bulk-job-list">
+            {bulkJobs.map((j) => (
+              <li key={j.key} className={`bulk-job status-${j.status}`}>
+                <div className="bulk-job-main">
+                  <span className="bulk-job-name" title={j.name}>
+                    {j.name}
+                  </span>
+                  <span className="bulk-job-status">
+                    {j.status === "queued" && "Queued"}
+                    {j.status === "uploading" && "Uploading / transcribing…"}
+                    {j.status === "auditing" && "Auditing…"}
+                    {j.status === "done" && (
+                      <>
+                        Done
+                        {j.callId != null && ` · Call #${j.callId}`}
+                        {j.score != null && ` · score ${j.score}`}
+                      </>
+                    )}
+                    {j.status === "failed" && "Failed"}
+                  </span>
+                </div>
+                <div className="bulk-job-meta">
+                  <span>{j.sizeMb} MB</span>
+                  {j.status === "done" && j.callId != null && (
+                    <button
+                      type="button"
+                      className="bulk-job-view"
+                      disabled={jobActive || callId === j.callId}
+                      onClick={() => setCallId(j.callId)}
+                    >
+                      View audit
+                    </button>
+                  )}
+                </div>
+                {j.error && <div className="bulk-job-error">{j.error}</div>}
+              </li>
+            ))}
+          </ul>
+          <p className="bulk-progress-hint">
+            Use the <b>View audit</b> dropdown above to switch between completed calls.
+          </p>
+        </section>
+      )}
+
+      {error && <div className="banner error">{error}</div>}
+      <JobProgress
+        active={jobActive}
+        phase={jobPhase}
+        fromUpload={jobFromUpload}
+      />
+
+      {!showLibrary && auditMain}
 
       {audit && (
         <footer className="player">
