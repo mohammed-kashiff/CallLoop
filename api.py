@@ -29,6 +29,8 @@ from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
+import qa_v8
+
 import applog
 
 load_dotenv()
@@ -313,24 +315,36 @@ def analyze_call(call_id, agent_override=None):
     with open(qa.RUBRIC_PATH) as f:
         rubric = json.load(f)
 
-    log.info(
-        "computing audit for call %d (%d criteria) — parallel Claude wave",
-        call_id, len(rubric["criteria"]),
-    )
+    is_v8 = qa_v8.is_v8_rubric(rubric)
+    if is_v8:
+        n_items = len(qa_v8.list_dimensions(rubric))
+        log.info(
+            "computing audit for call %d (%d v8 dimensions) — parallel Claude wave",
+            call_id, n_items,
+        )
+        criteria_arg = []
+    else:
+        n_items = len(rubric["criteria"])
+        log.info(
+            "computing audit for call %d (%d criteria) — parallel Claude wave",
+            call_id, n_items,
+        )
+        criteria_arg = rubric["criteria"]
 
-    # One parallel wave: all criteria + churn + feedback + retention email + Recap.
-    # Coaching is on-demand via POST /api/calls/{id}/coaching (keeps audit latency down).
+    # One parallel wave: dimensions/criteria + churn + feedback + Recap.
+    # Retention email + coaching tips are on-demand (button / compose).
     with ThreadPoolExecutor(max_workers=2) as pool:
         wave_f = pool.submit(
             qa.run_parallel_claude_wave,
-            rubric["criteria"], segments, agent, transcript_text,
+            criteria_arg, segments, agent, transcript_text,
+            None, rubric,
         )
         recap_f = pool.submit(
             pyai_recap.ensure_recap,
             call_id, segments, agent,
             meta.get("audio_seconds"), meta.get("pyai_call_id"),
         )
-        results, churn, feedback, retention_email = wave_f.result()
+        wave = wave_f.result()
         try:
             call_recap = recap_f.result()
         except Exception as e:  # noqa: BLE001
@@ -341,21 +355,36 @@ def analyze_call(call_id, agent_override=None):
             )
             call_recap = {"status": "error", "error": str(e)}
 
-    _rows, score, _e, _p, tally, gate_fails = qa.score_results(results)
-    grade = qa.performance_band(score)
+    churn = wave.get("churn")
+    feedback = wave.get("feedback")
+    manager_review = wave.get("manager_review") or []
+    # On-demand — drafted when Email stakeholder / Get tips is used
+    retention_email = {"status": "pending"}
 
-    findings = [
-        {
-            "id": cr["id"], "name": cr["name"], "method": cr["method"],
-            "weight": cr["weight"], "is_gate": bool(cr.get("is_gate")),
-            "verdict": res["verdict"], "reasoning": res.get("reasoning", ""),
-            "points": qa.awarded_points(cr, res["verdict"]),
-            "evidence_text": res.get("evidence_text"),
-            "evidence_seq": res.get("evidence_seq"),
-            "evidence_verified": res.get("evidence_verified"),
-        }
-        for cr, res in results
-    ]
+    if wave.get("mode") == "v8":
+        score = wave["score"]
+        grade = wave["grade"]
+        tally = wave["tally"]
+        findings = wave["findings"]
+        gate_fails = [t.get("reason", "manager_review") for t in manager_review]
+        flagged = bool(manager_review)
+    else:
+        results = wave["results"]
+        _rows, score, _e, _p, tally, gate_fails = qa.score_results(results)
+        grade = qa.performance_band(score, rubric)
+        findings = [
+            {
+                "id": cr["id"], "name": cr["name"], "method": cr["method"],
+                "weight": cr["weight"], "is_gate": bool(cr.get("is_gate")),
+                "verdict": res["verdict"], "reasoning": res.get("reasoning", ""),
+                "points": qa.awarded_points(cr, res["verdict"]),
+                "evidence_text": res.get("evidence_text"),
+                "evidence_seq": res.get("evidence_seq"),
+                "evidence_verified": res.get("evidence_verified"),
+            }
+            for cr, res in results
+        ]
+        flagged = bool(gate_fails)
 
     duration_ms = (time.perf_counter() - started) * 1000
     applog.event(
@@ -365,14 +394,19 @@ def analyze_call(call_id, agent_override=None):
         grade=grade,
         duration_ms=round(duration_ms, 1),
         recap_status=(call_recap or {}).get("status"),
+        flagged=flagged,
+        manager_review_count=len(manager_review),
     )
 
     return {
         "call_id": call_id, "audio_seconds": meta.get("audio_seconds"),
         "agent_speaker": agent, "rubric": rubric["name"],
+        "rubric_id": rubric.get("rubric_id") or rubric.get("name"),
         "score": score, "grade": grade, "tally": tally,
-        "gate_fails": gate_fails, "flagged": bool(gate_fails),
-        "segments": segments, "findings": findings, "coaching": [],
+        "gate_fails": gate_fails, "flagged": flagged,
+        "manager_review": manager_review,
+        "segments": segments, "findings": findings,
+        "coaching": [],
         "churn": churn, "feedback": feedback,
         "retention_email": retention_email, "recap": call_recap,
     }
@@ -504,31 +538,60 @@ def get_audit(call_id: int, refresh: bool = False):
     return audit
 
 
-@app.post("/api/calls/{call_id}/coaching")
-def post_coaching(call_id: int):
-    """On-demand coaching tips from weak findings (not part of the audit hot path)."""
-    audit, rh = _load_or_compute_audit(call_id, refresh=False)
-    weak = _weak_from_findings(audit.get("findings"))
-    if not weak:
-        log.info("coaching skipped for call %d — no weak findings", call_id)
-        audit["coaching"] = []
-        with _conn() as c:
-            c.execute(
-                "INSERT OR REPLACE INTO audits (call_id, audit_json, rubric_hash) "
-                "VALUES (?, ?, ?)",
-                (call_id, json.dumps(audit), rh),
-            )
-        return {"call_id": call_id, "coaching": []}
-
-    log.info("generating on-demand coaching for call %d (%d weak areas)", call_id, len(weak))
-    coaching = qa.generate_coaching(weak)
-    audit["coaching"] = coaching
+def _save_audit(call_id: int, audit: dict, rh: str):
     with _conn() as c:
         c.execute(
             "INSERT OR REPLACE INTO audits (call_id, audit_json, rubric_hash) "
             "VALUES (?, ?, ?)",
             (call_id, json.dumps(audit), rh),
         )
+
+
+def _ensure_retention_draft(call_id: int, audit: dict, rh: str) -> dict:
+    """
+    Run the retention Claude draft once if missing, cache on the audit, return updated audit.
+    """
+    existing = audit.get("retention_email") or {}
+    if existing.get("status") == "ok" and (existing.get("body") or "").strip():
+        return audit
+
+    call_id, _meta, segments = qa.load_call(call_id)
+    if not segments:
+        audit["retention_email"] = {
+            "status": "error",
+            "error": "No transcript segments available for retention draft.",
+            "subject": "",
+            "body": "",
+            "summary": "",
+            "suggested_actions": [],
+        }
+        _save_audit(call_id, audit, rh)
+        return audit
+
+    agent = audit.get("agent_speaker") or qa.classify_roles(segments)
+    transcript_text = qa.format_transcript(segments, agent)
+    log.info("on-demand retention draft for call %d", call_id)
+    draft = qa.draft_retention_email(transcript_text, segments)
+    audit["retention_email"] = draft
+    _save_audit(call_id, audit, rh)
+    return audit
+
+
+@app.post("/api/calls/{call_id}/coaching")
+def post_coaching(call_id: int):
+    """On-demand coaching tips (one Claude call) — not part of the audit hot path."""
+    audit, rh = _load_or_compute_audit(call_id, refresh=False)
+    weak = _weak_from_findings(audit.get("findings"))
+    if not weak:
+        log.info("coaching skipped for call %d — no weak findings", call_id)
+        audit["coaching"] = []
+        _save_audit(call_id, audit, rh)
+        return {"call_id": call_id, "coaching": []}
+
+    log.info("generating on-demand coaching for call %d (%d weak areas)", call_id, len(weak))
+    coaching = qa.generate_coaching(weak)
+    audit["coaching"] = coaching
+    _save_audit(call_id, audit, rh)
     return {"call_id": call_id, "coaching": coaching}
 
 
@@ -536,9 +599,10 @@ def post_coaching(call_id: int):
 def get_stakeholder_email_compose(call_id: int):
     """
     Prefill a Gmail compose draft for this call's churn alert.
+    Drafts the retention email with Claude on first use, then caches it.
     Frontend opens gmail_url in a new tab (user sends from their own Gmail).
     """
-    audit, _rh = _load_or_compute_audit(call_id, refresh=False)
+    audit, rh = _load_or_compute_audit(call_id, refresh=False)
     risk = ((audit.get("churn") or {}).get("risk") or "").lower()
     if risk not in ("high", "medium"):
         raise HTTPException(
@@ -549,10 +613,12 @@ def get_stakeholder_email_compose(call_id: int):
             ),
         )
 
+    audit = _ensure_retention_draft(call_id, audit, rh)
     payload = email_notify.build_compose_payload(call_id, audit)
     log.info(
-        "stakeholder Gmail compose for call %d (risk=%s, to=%s)",
+        "stakeholder Gmail compose for call %d (risk=%s, to=%s, retention=%s)",
         call_id, risk, payload.get("to") or "(blank)",
+        (audit.get("retention_email") or {}).get("status"),
     )
     return {
         "call_id": call_id,
@@ -562,6 +628,7 @@ def get_stakeholder_email_compose(call_id: int):
         "subject": payload["subject"],
         "body": payload["body"],
         "gmail_url": payload["gmail_url"],
+        "retention_email": audit.get("retention_email"),
     }
 
 

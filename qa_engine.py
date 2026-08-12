@@ -26,6 +26,7 @@ import httpx
 from dotenv import load_dotenv
 
 import rules
+import qa_v8
 import applog
 
 load_dotenv()
@@ -380,7 +381,7 @@ def evaluate_all_criteria(criteria, segments, agent_speaker, transcript_text, ma
 def draft_retention_email(transcript_text, segments):
     """
     Draft a stakeholder retention email from the transcript (one Claude call).
-    Intended to run in the parallel audit wave alongside churn/feedback/criteria.
+    On-demand only — not part of the first-load audit wave.
     """
     prompt = (
         "You are a customer-retention specialist writing an INTERNAL email a manager can send "
@@ -444,18 +445,39 @@ def draft_retention_email(transcript_text, segments):
     }
 
 
-def run_parallel_claude_wave(criteria, segments, agent_speaker, transcript_text, max_workers=None):
+def run_parallel_claude_wave(criteria, segments, agent_speaker, transcript_text, max_workers=None, rubric=None):
     """
-    Fire all independent Claude work in one parallel wave:
-    every rubric criterion + churn + customer feedback + retention email draft.
-    Coaching is NOT included (it depends on weak-area results).
+    Fire independent Claude work in one parallel wave (dimensions/criteria +
+    churn + feedback). Retention email and coaching tips are on-demand.
     """
+    if rubric is not None and qa_v8.is_v8_rubric(rubric):
+        ordered, churn, feedback, retention_email, score, tally, grade, hostile, manager_review = (
+            qa_v8.run_v8_wave(
+                rubric, segments, agent_speaker, transcript_text,
+                call_claude, parse_json, build_prompt, validate_evidence,
+                assess_churn, extract_feedback,
+                max_workers=max_workers,
+            )
+        )
+        return {
+            "mode": "v8",
+            "results": ordered,
+            "churn": churn,
+            "feedback": feedback,
+            "retention_email": retention_email,  # None — drafted on Email stakeholder
+            "score": score,
+            "tally": tally,
+            "grade": grade,
+            "hostile": hostile,
+            "manager_review": manager_review,
+            "findings": qa_v8.findings_from_v8(ordered),
+        }
+
     n = len(criteria)
-    workers = max_workers or min(32, max(4, n + 3))
+    workers = max_workers or min(32, max(4, n + 2))
     ordered = [None] * n
     churn = None
     feedback = None
-    retention_email = None
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futs = {}
@@ -465,25 +487,26 @@ def run_parallel_claude_wave(criteria, segments, agent_speaker, transcript_text,
             )] = ("crit", i, cr)
         futs[pool.submit(assess_churn, transcript_text, segments)] = ("churn", None, None)
         futs[pool.submit(extract_feedback, transcript_text, segments)] = ("feedback", None, None)
-        futs[pool.submit(draft_retention_email, transcript_text, segments)] = (
-            "retention", None, None
-        )
         for fut in as_completed(futs):
             kind, i, cr = futs[fut]
             if kind == "crit":
                 ordered[i] = (cr, fut.result())
             elif kind == "churn":
                 churn = fut.result()
-            elif kind == "feedback":
-                feedback = fut.result()
             else:
-                retention_email = fut.result()
+                feedback = fut.result()
     log.info(
         "parallel Claude wave done in %.1fs "
-        "(%d criteria + churn + feedback + retention email, workers=%d)",
+        "(%d criteria + churn + feedback, workers=%d)",
         time.perf_counter() - t0, n, workers,
     )
-    return ordered, churn, feedback, retention_email
+    return {
+        "mode": "v3",
+        "results": ordered,
+        "churn": churn,
+        "feedback": feedback,
+        "retention_email": None,
+    }
 
 
 # ---------- Scoring ----------
@@ -491,7 +514,12 @@ FRACTION = {"pass": 1.0, "partial": 0.5, "fail": 0.0, "unverified": 0.0}
 SCORE_EXCLUDED = {"not_applicable", "error"}
 
 
-def performance_band(score):
+def performance_band(score, rubric=None):
+    """Keep numeric score primary; band is a display label.
+    Prefers v8 rubric bands when available; falls back to legacy labels."""
+    if rubric is not None and qa_v8.is_v8_rubric(rubric):
+        return qa_v8.performance_band(score, rubric)
+    # Legacy labels (still available for old cached audits / v3 rubrics)
     if score >= 90:
         return "Excellent"
     if score >= 75:
@@ -643,21 +671,47 @@ def main():
 
     log.info("auditing call %d (%ss, %d turns) against '%s'",
              call_id, meta.get("audio_seconds"), len(segments), rubric["name"])
-    results = evaluate_all_criteria(
-        rubric["criteria"], segments, agent, transcript_text
-    )
-    rows, score, earned, possible, tally, gate_fails = score_results(results)
-    grade = performance_band(score)
 
-    print("=" * 72)
-    for c, res, pts in rows:
-        gate = " [GATE]" if c.get("is_gate") else ""
-        pt = "  -  " if pts is None else f"{pts:>5}/{c['weight']}"
-        print(f"[{c['method']}]{gate} {c['name']} -> {LABEL.get(res['verdict'], res['verdict'])}  {pt}")
-    if gate_fails:
-        print(f"\n!! GATE FAILURE - flag for manager review: {', '.join(gate_fails)}")
-    print(f"TOTAL: {score}/100 ({earned} of {possible} weighted points) -> {grade.upper()}")
-    print("=" * 72)
+    if qa_v8.is_v8_rubric(rubric):
+        wave = run_parallel_claude_wave(
+            [], segments, agent, transcript_text, rubric=rubric,
+        )
+        results = wave["results"]
+        score = wave["score"]
+        grade = wave["grade"]
+        tally = wave["tally"]
+        manager_review = wave.get("manager_review") or []
+        print("=" * 72)
+        for dim, res in results:
+            weight = dim.get("weight") or 0
+            v = res.get("verdict")
+            frac = FRACTION.get(v)
+            pt = "  -  " if frac is None else f"{round(weight * frac, 1):>5}/{weight}"
+            print(
+                f"[{dim.get('method')}] {dim['name']} -> "
+                f"{LABEL.get(v, v)}  {pt}"
+            )
+        if manager_review:
+            reasons = ", ".join(t.get("reason", "?") for t in manager_review)
+            print(f"\n!! MANAGER REVIEW: {reasons}")
+        print(f"TOTAL: {score}/100 -> {grade.upper()}  tally={tally}")
+        print("=" * 72)
+    else:
+        results = evaluate_all_criteria(
+            rubric["criteria"], segments, agent, transcript_text
+        )
+        rows, score, earned, possible, tally, gate_fails = score_results(results)
+        grade = performance_band(score, rubric)
+
+        print("=" * 72)
+        for c, res, pts in rows:
+            gate = " [GATE]" if c.get("is_gate") else ""
+            pt = "  -  " if pts is None else f"{pts:>5}/{c['weight']}"
+            print(f"[{c['method']}]{gate} {c['name']} -> {LABEL.get(res['verdict'], res['verdict'])}  {pt}")
+        if gate_fails:
+            print(f"\n!! GATE FAILURE - flag for manager review: {', '.join(gate_fails)}")
+        print(f"TOTAL: {score}/100 ({earned} of {possible} weighted points) -> {grade.upper()}")
+        print("=" * 72)
 
 
 if __name__ == "__main__":

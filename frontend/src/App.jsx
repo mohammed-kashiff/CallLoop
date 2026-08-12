@@ -24,12 +24,44 @@ function fmtElapsed(totalSec) {
 function bandClass(grade) {
   return (
     {
+      // v8 bands
+      "Star Performer": "band-excellent",
+      Excelling: "band-excellent",
+      "Solid Performer": "band-good",
+      Developing: "band-fair",
+      "Needs Improvement": "band-fair",
+      "Needs Immediate Attention": "band-poor",
+      // legacy v3 bands
       Excellent: "band-excellent",
       Good: "band-good",
       "Needs improvement": "band-fair",
       Poor: "band-poor",
     }[grade] || "band-fair"
   );
+}
+
+function formatReviewReasons(triggers) {
+  const labels = {
+    hostile_language_override: "hostile language",
+    low_overall_score: "low overall score",
+  };
+  return (triggers || [])
+    .map((t) => labels[t.reason] || String(t.reason || "").replace(/_/g, " "))
+    .filter(Boolean)
+    .join("; ");
+}
+
+function shortRubricLabel(audit) {
+  const id = audit?.rubric_id;
+  if (id) return String(id).replace(/_/g, " ");
+  const name = audit?.rubric || "";
+  return name.length > 52 ? `${name.slice(0, 49)}…` : name;
+}
+
+function methodLabel(method) {
+  if (!method) return "scored";
+  if (method === "llm" || String(method).includes("llm")) return "AI judgment";
+  return "Rule check";
 }
 
 /** Client-side progress + elapsed timer (no server progress stream). */
@@ -68,14 +100,14 @@ function JobProgress({ active, phase, fromUpload }) {
 
   const label =
     phase === "transcribe"
-      ? "Transcribing your call…"
+      ? "Transcribing…"
       : phase === "audit"
-        ? "Auditing the call…"
+        ? "Scoring the call…"
         : "Working…";
   const hint =
     phase === "transcribe"
-      ? "Uploading audio and waiting on PyAI Hear (often 20–40s)."
-      : "Running rubric, churn, feedback, and retention draft in parallel.";
+      ? "Usually 20–40 seconds."
+      : "Rubric, churn, feedback, and draft email run together.";
 
   return (
     <div className="job-progress" aria-live="polite">
@@ -162,7 +194,18 @@ export default function App() {
         if (!r.ok) throw new Error();
         return r.json();
       })
-      .then(setAudit)
+      .then((data) => {
+        setAudit(data);
+        if (data.flagged || (data.manager_review && data.manager_review.length)) {
+          setManualReviewFlagged(true);
+          const reasons = formatReviewReasons(data.manager_review);
+          setManualReviewMessage(
+            reasons
+              ? `Auto-flagged for manager review: ${reasons}.`
+              : `Call #${id} flagged for manual review.`,
+          );
+        }
+      })
       .catch(() => setError("Could not load the audit for this call."))
       .finally(() => {
         setLoading(false);
@@ -281,7 +324,24 @@ export default function App() {
       if (lastOkId != null) {
         // Show the last completed audit; dropdown can switch to any other.
         setCallId(lastOkId);
-        if (lastAudit) setAudit(lastAudit);
+        if (lastAudit) {
+          setAudit(lastAudit);
+          if (
+            lastAudit.flagged ||
+            (lastAudit.manager_review && lastAudit.manager_review.length)
+          ) {
+            setManualReviewFlagged(true);
+            const reasons = formatReviewReasons(lastAudit.manager_review);
+            setManualReviewMessage(
+              reasons
+                ? `Auto-flagged for manager review: ${reasons}.`
+                : `Call #${lastOkId} flagged for manual review.`,
+            );
+          } else {
+            setManualReviewFlagged(false);
+            setManualReviewMessage(null);
+          }
+        }
       }
     } finally {
       setUploading(false);
@@ -342,6 +402,11 @@ export default function App() {
         );
       }
       setEmailStatus("opened");
+      setAudit((prev) =>
+        prev && d.retention_email
+          ? { ...prev, retention_email: d.retention_email }
+          : prev,
+      );
       setEmailMessage(
         d.to
           ? `Gmail compose opened (To: ${d.to}). Review and send.`
@@ -355,10 +420,10 @@ export default function App() {
 
   function flagForManualReview() {
     if (callId == null || manualReviewFlagged) return;
-    // Backend / workflow logic TBD — UI placeholder only for now.
+    // Manual override (audit may already auto-flag via manager_review triggers).
     setManualReviewFlagged(true);
     setManualReviewMessage(
-      `Call #${callId} flagged for manual review. Workflow rules will be wired next.`,
+      `Call #${callId} flagged for manual review.`,
     );
   }
 
@@ -429,7 +494,7 @@ export default function App() {
                   onClick={flagForManualReview}
                   disabled={manualReviewFlagged}
                 >
-                  {manualReviewFlagged ? "Flagged for review" : "Flag for manual review"}
+                  {manualReviewFlagged ? "Flagged" : "Flag for review"}
                 </button>
                 {manualReviewMessage && (
                   <div className="flag-review-msg">{manualReviewMessage}</div>
@@ -438,19 +503,23 @@ export default function App() {
             </div>
 
             <div className="rubric-line">
-              Rubric: <b>{audit.rubric}</b> · agent = {audit.agent_speaker} ·{" "}
+              <b>{shortRubricLabel(audit)}</b>
+              {" · "}
               {fmtTime(audit.audio_seconds)}
+              {" · agent "}
+              {audit.agent_speaker}
             </div>
 
             <section className={`churn churn-${churnRisk}`}>
               <div className="churn-head">
                 <span className="churn-title">
+                  Churn{" "}
                   {churnRisk === "none" ? (
-                    <>Churn risk: <b>None</b></>
+                    <b>none</b>
                   ) : churnRisk === "unknown" ? (
-                    <>Churn risk: <b>Unavailable</b></>
+                    <b>unavailable</b>
                   ) : (
-                    <>Churn risk: <b>{churnRisk}</b></>
+                    <b>{churnRisk}</b>
                   )}
                 </span>
                 {(churnRisk === "high" || churnRisk === "medium") && (
@@ -461,13 +530,11 @@ export default function App() {
                       disabled={emailStatus === "opening"}
                     >
                       {emailStatus === "opening"
-                        ? "Opening Gmail…"
-                        : "Send email to stakeholder"}
+                        ? "Drafting email…"
+                        : "Email stakeholder"}
                     </button>
                     {retentionReady && emailStatus !== "error" && (
-                      <span className="churn-queued">
-                        Retention email draft ready (from transcript)
-                      </span>
+                      <span className="churn-queued">Draft ready</span>
                     )}
                     {emailStatus === "opened" && emailMessage && (
                       <span className="churn-queued">{emailMessage}</span>
@@ -502,8 +569,8 @@ export default function App() {
             </section>
 
             {callRecap && (
-              <section className={`call-recap recap-${recapStatus}`}>
-                <h2 className="h">Call Recap</h2>
+              <section className={`call-recap panel recap-${recapStatus}`}>
+                <h2 className="h">Recap</h2>
                 {recapStatus === "ok" ? (
                   <>
                     {(callRecap.tldr || callRecap.headline) && (
@@ -560,7 +627,8 @@ export default function App() {
 
             <h2 className="h">Findings</h2>
             {audit.findings.map((f) => {
-              const pts = (FRACTION[f.verdict] ?? 0) * f.weight;
+              const pts =
+                f.points != null ? f.points : (FRACTION[f.verdict] ?? 0) * f.weight;
               const seg = f.evidence_seq != null ? segBySeq[f.evidence_seq] : null;
               return (
                 <div className="finding" key={f.id}>
@@ -571,21 +639,19 @@ export default function App() {
                       {pts} / {f.weight}
                     </span>
                   </div>
-                  <div className="finding-tag">
-                    {f.method === "llm" ? "AI judgment" : "deterministic rule"}
-                  </div>
+                  <div className="finding-tag">{methodLabel(f.method)}</div>
                   <p className="finding-reason">{f.reasoning}</p>
                   {f.evidence_text && (
                     <div className="evidence">
                       <span className="quote">“{f.evidence_text}”</span>
-                      {f.method === "llm" && (
+                      {String(f.method || "").includes("llm") && (
                         <span className={`verify ${f.evidence_verified ? "ok" : "no"}`}>
-                          {f.evidence_verified ? "✓ verified" : "✗ rejected"}
+                          {f.evidence_verified ? "verified" : "unverified"}
                         </span>
                       )}
                       {seg && (
                         <button className="jump" onClick={() => jumpTo(seg.start)}>
-                          ▶ {fmtTime(seg.start)}
+                          {fmtTime(seg.start)}
                         </button>
                       )}
                     </div>
@@ -606,18 +672,16 @@ export default function App() {
                     {coachingLoading
                       ? "Generating…"
                       : coaching.length > 0
-                        ? "Regenerate coaching"
-                        : "Generate coaching tips"}
+                        ? "Refresh tips"
+                        : "Get tips"}
                   </button>
                 )}
               </div>
               {coachingError && <div className="banner error">{coachingError}</div>}
               {weakCount === 0 ? (
-                <p className="coach-empty">No weak areas — coaching not needed for this call.</p>
+                <p className="coach-empty">Nothing to coach — all dimensions passed.</p>
               ) : coaching.length === 0 && !coachingLoading ? (
-                <p className="coach-empty">
-                  Coaching is optional and runs only when you ask — press the button to generate tips.
-                </p>
+                <p className="coach-empty">Optional — runs one Claude call when you ask.</p>
               ) : (
                 coaching.map((c, i) => (
                   <div className="coach" key={i}>
@@ -630,7 +694,7 @@ export default function App() {
 
             {audit.feedback && (
               <section className="customer-feedback">
-                <h2 className="h">Customer Feedback</h2>
+                <h2 className="h">Feedback</h2>
 
                 {feedbackStatus === "error" ? (
                   <div className="banner error">
@@ -706,7 +770,7 @@ export default function App() {
 
           <section className="col-right">
             <h2 className="h">
-              Transcript <span className="hint">click any line to hear it</span>
+              Transcript <span className="hint">click a line to play</span>
             </h2>
             <div className="transcript">
               {audit.segments.map((s) => {
@@ -737,9 +801,12 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <span className="logo">◆</span>
+          <span className="logo" aria-hidden="true">
+            <span className="logo-ring" />
+            <span className="logo-dot" />
+          </span>
           <span className="brand-name">CallProof</span>
-          <span className="tagline">AI Call Quality Auditor</span>
+          <span className="tagline">Call QA · PyAI</span>
         </div>
         <div className="topbar-actions">
           <button
@@ -747,11 +814,11 @@ export default function App() {
             className={`library-toggle ${showLibrary ? "on" : ""}`}
             onClick={() => setShowLibrary((v) => !v)}
           >
-            {showLibrary ? "Hide library" : "Calls library"}
+            {showLibrary ? "Hide calls" : "All calls"}
           </button>
           {calls.filter((c) => c.status === "completed" || !c.status).length > 0 && (
             <label className="call-select-wrap">
-              <span className="call-select-label">View audit</span>
+              <span className="call-select-label">Call</span>
               <select
                 className="call-select"
                 value={callId ?? ""}
@@ -764,13 +831,13 @@ export default function App() {
                   const scored = scoreByCallId[c.id] ?? c.score;
                   const scoreLabel =
                     scored != null
-                      ? ` — score ${scored}`
+                      ? ` · ${scored}`
                       : callId === c.id && audit?.score != null
-                        ? ` — score ${audit.score}`
+                        ? ` · ${audit.score}`
                         : "";
                   return (
                     <option key={c.id} value={c.id}>
-                      Call #{c.id} — {fmtTime(c.audio_seconds)}
+                      #{c.id} · {fmtTime(c.audio_seconds)}
                       {scoreLabel}
                     </option>
                   );
@@ -785,10 +852,9 @@ export default function App() {
         <section className="calls-library" aria-label="Stored calls library">
           <div className="calls-library-head">
             <div>
-              <h2 className="calls-library-title">Stored calls</h2>
+              <h2 className="calls-library-title">All calls</h2>
               <p className="calls-library-sub">
-                From local SQLite (<code>callproof.db</code>) — {calls.length} call
-                {calls.length === 1 ? "" : "s"}
+                {calls.length} call{calls.length === 1 ? "" : "s"} saved
               </p>
             </div>
             <button
@@ -865,8 +931,8 @@ export default function App() {
                             {active && audit && audit.call_id === c.id
                               ? "Viewing"
                               : active && loading
-                                ? "Loading…"
-                                : "Open audit"}
+                                ? "…"
+                                : "Open"}
                           </button>
                         </td>
                       </tr>
@@ -893,8 +959,7 @@ export default function App() {
             </div>
           )}
           <p className="calls-library-hint">
-            * Score marked with an asterisk may be stale after a rubric change
-            (cached audit was scored under an older rubric).
+            * Stale after a rubric change — open the call to refresh the score.
           </p>
         </section>
       )}
@@ -918,16 +983,18 @@ export default function App() {
           onChange={(e) => handleFiles(e.target.files)}
         />
         {bulkRunning ? (
-          <span>
-            Importing batch — {bulkDoneCount + bulkFailedCount} / {bulkJobs.length} finished
+          <span className="dropzone-title">
+            Importing {bulkDoneCount + bulkFailedCount} / {bulkJobs.length}
           </span>
         ) : uploading ? (
-          <span>Transcribing in progress — see timer below</span>
+          <span className="dropzone-title">Transcribing…</span>
         ) : (
-          <span>
-            Drag up to {MAX_BULK_FILES} call recordings here, or click to choose
-            files (max {MAX_UPLOAD_MB} MB each)
-          </span>
+          <>
+            <span className="dropzone-title">Drop call recordings</span>
+            <span className="dropzone-sub">
+              Up to {MAX_BULK_FILES} files · {MAX_UPLOAD_MB} MB each · or click to browse
+            </span>
+          </>
         )}
       </div>
       {bulkNote && <div className="banner">{bulkNote}</div>}
@@ -936,7 +1003,7 @@ export default function App() {
       {bulkJobs.length > 0 && (
         <section className="bulk-progress" aria-live="polite">
           <div className="bulk-progress-head">
-            <h2 className="bulk-progress-title">Batch import</h2>
+            <h2 className="bulk-progress-title">Import</h2>
             <span className="bulk-progress-count">
               {bulkDoneCount} done
               {bulkFailedCount ? ` · ${bulkFailedCount} failed` : ""}
@@ -983,7 +1050,7 @@ export default function App() {
             ))}
           </ul>
           <p className="bulk-progress-hint">
-            Use the <b>View audit</b> dropdown above to switch between completed calls.
+            Switch calls from the dropdown above.
           </p>
         </section>
       )}

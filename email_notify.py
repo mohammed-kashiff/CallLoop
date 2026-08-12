@@ -66,8 +66,8 @@ def churn_alert_content(call_id: int, audit: dict) -> dict:
     """
     Return {to, subject, body, risk} for a churn/retention stakeholder alert.
 
-    Prefers the parallel Claude retention_email draft when present; otherwise
-    falls back to a structured template from churn fields.
+    Prefers a Claude retention_email draft when present (drafted on demand at
+    compose time); otherwise falls back to a structured template from churn fields.
     """
     churn = audit.get("churn") or {}
     risk = (churn.get("risk") or "unknown").upper()

@@ -1,10 +1,2 @@
-:root { color-scheme: light; }
-* { box-sizing: border-box; }
 html, body, #root { height: 100%; }
-body {
-  margin: 0;
-  font-family: "Segoe UI", ui-sans-serif, -apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif;
-  background: #f4f1eb;
-  color: #152033;
-  -webkit-font-smoothing: antialiased;
-}
+body { margin: 0; }
