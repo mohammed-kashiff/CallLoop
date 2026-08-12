@@ -1,32 +1,16 @@
-# CALL LOOP (CallProof UI)
+# React + Vite
 
-Vite + React + TypeScript frontend integrated with the CallProof FastAPI backend.
+This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
 
-## Run
+Currently, two official plugins are available:
 
-Terminal 1 — API (repo root):
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
 
-```bash
-.venv/bin/uvicorn api:app --reload --port 8000
-```
+## React Compiler
 
-Terminal 2 — UI:
+The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
 
-```bash
-cd frontend
-npm install
-npm run dev
-```
+## Expanding the Oxlint configuration
 
-Open the URL Vite prints (usually `http://localhost:5173`).
-
-Optional: `VITE_API_BASE=http://127.0.0.1:8000` if the API is not on localhost:8000.
-
-## What talks to the backend
-
-- Upload MP3 → `POST /api/upload` (transcribe)
-- Audit → `GET /api/calls/{id}/audit`
-- Coaching → `POST /api/calls/{id}/coaching`
-- Audio → `GET /api/calls/{id}/audio`
-
-Sample audit button stays offline (demo data only).
+If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.

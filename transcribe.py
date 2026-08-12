@@ -84,8 +84,24 @@ def init_db():
     cols = [r[1] for r in conn.execute("PRAGMA table_info(calls)").fetchall()]
     if "pyai_call_id" not in cols:
         conn.execute("ALTER TABLE calls ADD COLUMN pyai_call_id TEXT")
+    if "filename" not in cols:
+        conn.execute("ALTER TABLE calls ADD COLUMN filename TEXT")
     conn.commit()
     return conn
+
+
+def sanitize_filename(name: str | None, fallback: str = "recording.mp3") -> str:
+    """Keep a safe display name from an upload (basename only, no path tricks)."""
+    raw = (name or "").strip() or fallback
+    base = os.path.basename(raw.replace("\\", "/"))
+    base = base.strip().lstrip(".")
+    if not base:
+        base = fallback
+    # Cap length; keep extension if present
+    if len(base) > 180:
+        root, ext = os.path.splitext(base)
+        base = root[: 180 - len(ext)] + ext
+    return base
 
 
 def new_pyai_call_id():
@@ -98,14 +114,15 @@ def find_existing_call(conn, identity):
         (identity,)).fetchone()
 
 
-def save_transcript(conn, identity, job_id, result, pyai_call_id=None):
+def save_transcript(conn, identity, job_id, result, pyai_call_id=None, filename=None):
     segments = result.get("segments") or []
+    safe_name = sanitize_filename(filename) if filename else None
     cur = conn.execute(
         """INSERT INTO calls (audio_url, job_id, status, full_text, speakers, audio_seconds,
-           raw_json, pyai_call_id)
-           VALUES (?, ?, 'completed', ?, ?, ?, ?, ?)""",
+           raw_json, pyai_call_id, filename)
+           VALUES (?, ?, 'completed', ?, ?, ?, ?, ?, ?)""",
         (identity, job_id, result.get("text", ""), result.get("speakers"),
-         result.get("audio_seconds"), json.dumps(result), pyai_call_id))
+         result.get("audio_seconds"), json.dumps(result), pyai_call_id, safe_name))
     call_id = cur.lastrowid
     for i, seg in enumerate(segments):
         conn.execute(
@@ -114,9 +131,24 @@ def save_transcript(conn, identity, job_id, result, pyai_call_id=None):
             (call_id, i, seg.get("speaker"), seg.get("channel"),
              seg.get("start"), seg.get("end"), seg.get("text")))
     conn.commit()
-    log.info("saved transcript for call %d (%d segments, pyai_call_id=%s)",
-             call_id, len(segments), pyai_call_id)
+    log.info(
+        "saved transcript for call %d (%d segments, pyai_call_id=%s, filename=%s)",
+        call_id, len(segments), pyai_call_id, safe_name,
+    )
     return call_id
+
+
+def set_filename_if_empty(conn, call_id, filename):
+    """Backfill filename on deduped uploads when the row has no name yet."""
+    if not filename:
+        return
+    safe = sanitize_filename(filename)
+    conn.execute(
+        """UPDATE calls SET filename=?
+           WHERE id=? AND (filename IS NULL OR TRIM(filename) = '')""",
+        (safe, call_id),
+    )
+    conn.commit()
 
 
 # ---------- PyAI service wrapper ----------
@@ -343,7 +375,11 @@ def main():
     pyai_id = new_pyai_call_id()
     job_id = submit_job_url(src, call_id=pyai_id) if is_url(src) else submit_job_file(src, call_id=pyai_id)
     result = poll_job(job_id)
-    call_id = save_transcript(conn, identity, job_id, result, pyai_call_id=pyai_id)
+    call_id = save_transcript(
+        conn, identity, job_id, result,
+        pyai_call_id=pyai_id,
+        filename=None if is_url(src) else os.path.basename(src),
+    )
     log.info("done: call id %d", call_id)
 
 

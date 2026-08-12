@@ -272,6 +272,9 @@ def _startup():
         cols = [r[1] for r in c.execute("PRAGMA table_info(audits)").fetchall()]
         if "rubric_hash" not in cols:
             c.execute("ALTER TABLE audits ADD COLUMN rubric_hash TEXT")
+        call_cols = [r[1] for r in c.execute("PRAGMA table_info(calls)").fetchall()]
+        if "filename" not in call_cols:
+            c.execute("ALTER TABLE calls ADD COLUMN filename TEXT")
     os.makedirs(AUDIO_DIR, exist_ok=True)
     log.info("startup complete; db=%s", DB_PATH)
 
@@ -283,6 +286,22 @@ _startup()
 def _rubric_hash():
     with open(qa.RUBRIC_PATH, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()[:16]
+
+
+def _call_filename(call_id: int) -> str:
+    with _conn() as c:
+        row = c.execute("SELECT filename FROM calls WHERE id=?", (call_id,)).fetchone()
+    name = (row["filename"] if row else None) or ""
+    name = name.strip()
+    return name or f"call-{call_id}.mp3"
+
+
+def _attach_filename(audit: dict, call_id: int) -> dict:
+    out = dict(audit)
+    out["call_id"] = call_id
+    out["filename"] = _call_filename(call_id)
+    return out
+
 
 
 def analyze_call(call_id, agent_override=None):
@@ -401,7 +420,9 @@ def analyze_call(call_id, agent_override=None):
     )
 
     return {
-        "call_id": call_id, "audio_seconds": meta.get("audio_seconds"),
+        "call_id": call_id,
+        "filename": _call_filename(call_id),
+        "audio_seconds": meta.get("audio_seconds"),
         "agent_speaker": agent, "rubric": rubric["name"],
         "rubric_id": rubric.get("rubric_id") or rubric.get("name"),
         "score": score, "grade": grade, "tally": tally,
@@ -470,6 +491,7 @@ def list_calls():
               c.created_at,
               c.pyai_call_id,
               c.job_id,
+              c.filename,
               (SELECT COUNT(*) FROM segments s WHERE s.call_id = c.id) AS segment_count,
               a.audit_json,
               a.rubric_hash,
@@ -482,8 +504,10 @@ def list_calls():
 
     out = []
     for r in rows:
+        fname = (r["filename"] or "").strip() or f"call-{r['id']}.mp3"
         item = {
             "id": r["id"],
+            "filename": fname,
             "status": r["status"],
             "audio_seconds": r["audio_seconds"],
             "speakers": r["speakers"],
@@ -579,6 +603,7 @@ def export_calls(format: str = "csv"):
             """
             SELECT
               c.id,
+              c.filename,
               c.status,
               c.audio_seconds,
               c.created_at,
@@ -603,8 +628,10 @@ def export_calls(format: str = "csv"):
         recap_tldr, recap_summary, recap_actions = _recap_export_fields(audit.get("recap"))
         coaching = _coaching_export_text(audit)
         churn = audit.get("churn") or {}
+        fname = (r["filename"] or "").strip() or f"call-{r['id']}.mp3"
         records.append({
             "call_id": r["id"],
+            "filename": fname,
             "created_at": r["created_at"] or "",
             "audited_at": r["audited_at"] or "",
             "audio_seconds": r["audio_seconds"],
@@ -635,7 +662,7 @@ def export_calls(format: str = "csv"):
 
     buf = io.StringIO()
     fields = [
-        "call_id", "created_at", "audited_at", "audio_seconds",
+        "filename", "call_id", "created_at", "audited_at", "audio_seconds",
         "score", "grade", "flagged", "churn_risk", "ratings",
         "recap_tldr", "recap_summary", "recap_actions", "coaching",
     ]
@@ -674,7 +701,7 @@ def get_audit(call_id: int, refresh: bool = False):
                 "cache HIT  call %d (score %s) - returning stored audit",
                 call_id, cached.get("score"),
             )
-            return cached
+            return _attach_filename(cached, call_id)
         applog.event(log, "audit_cache", result="MISS", call_id=call_id)
         log.info("cache MISS  call %d - computing fresh audit", call_id)
     else:
@@ -682,7 +709,7 @@ def get_audit(call_id: int, refresh: bool = False):
         log.info("cache BYPASS (refresh) call %d - computing fresh audit", call_id)
     audit, _rh = _load_or_compute_audit(call_id, refresh=True)
     log.info("cached audit for call %d (score %s)", call_id, audit["score"])
-    return audit
+    return _attach_filename(audit, call_id)
 
 
 def _save_audit(call_id: int, audit: dict, rh: str):
@@ -825,15 +852,19 @@ def upload(file: UploadFile = File(...)):
     with open(tmp, "wb") as f:
         f.write(data)
 
+    source_name = transcribe.sanitize_filename(file.filename)
+
     try:
         identity = transcribe.identity_for(tmp)
         conn = sqlite3.connect(DB_PATH)
         existing = transcribe.find_existing_call(conn, identity)
         if existing:
             call_id = existing[0]
+            transcribe.set_filename_if_empty(conn, call_id, source_name)
             applog.event(
                 log, "transcription_success",
                 call_id=call_id, deduped=True, size_bytes=size,
+                filename=source_name,
             )
             log.info(
                 "upload deduped to existing call %d (no re-transcription)", call_id
@@ -843,7 +874,9 @@ def upload(file: UploadFile = File(...)):
             job_id = transcribe.submit_job_file(tmp, call_id=pyai_id)
             result = transcribe.poll_job(job_id)
             call_id = transcribe.save_transcript(
-                conn, identity, job_id, result, pyai_call_id=pyai_id
+                conn, identity, job_id, result,
+                pyai_call_id=pyai_id,
+                filename=source_name,
             )
             applog.event(
                 log, "transcription_success",
@@ -853,10 +886,11 @@ def upload(file: UploadFile = File(...)):
                 segments=len(result.get("segments") or []),
                 size_bytes=size,
                 deduped=False,
+                filename=source_name,
             )
             log.info(
-                "transcription complete -> new call %d (pyai_call_id=%s)",
-                call_id, pyai_id,
+                "transcription complete -> new call %d (filename=%s, pyai_call_id=%s)",
+                call_id, source_name, pyai_id,
             )
         conn.close()
         os.replace(tmp, os.path.join(AUDIO_DIR, f"{call_id}.mp3"))
@@ -884,4 +918,4 @@ def upload(file: UploadFile = File(...)):
         if os.path.exists(tmp):
             os.remove(tmp)
 
-    return {"call_id": call_id}
+    return {"call_id": call_id, "filename": _call_filename(call_id)}
