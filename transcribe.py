@@ -24,6 +24,7 @@ import httpx
 from dotenv import load_dotenv
 
 import applog
+import pyai_usage
 
 load_dotenv()
 applog.setup_logging()
@@ -335,7 +336,7 @@ def submit_job_url(audio_url, call_id=None):
         if RECAP_PACK_ID:
             body["pack_id"] = RECAP_PACK_ID
     idem = hashlib.sha256(audio_url.encode()).hexdigest()[:32]
-    resp = httpx.post(f"{BASE_URL}/v1/transcription/jobs", json=body,
+    resp = pyai_usage.post(f"{BASE_URL}/v1/transcription/jobs", json=body,
                       headers={**HEADERS, "Idempotency-Key": idem}, timeout=60)
     return _job_id_from(resp)
 
@@ -377,7 +378,7 @@ def submit_job_file(path, call_id=None):
     log.info("submitting %.2f MB to PyAI Hear (%s mode, call_id=%s)",
              len(audio_bytes) / 1_000_000, SEPARATION_MODE, call_id)
 
-    resp = httpx.post(
+    resp = pyai_usage.post(
         f"{BASE_URL}/v1/transcription/jobs",
         files=files, data=data, headers=HEADERS, timeout=120,
     )
@@ -438,7 +439,7 @@ def _submit_sync_fallback(audio_bytes, path, data):
         sync_data["numerals"] = data["numerals"]
 
     log.info("sync fallback: POST /v1/audio/transcriptions")
-    resp = httpx.post(
+    resp = pyai_usage.post(
         f"{BASE_URL}/v1/audio/transcriptions",
         files=files, data=sync_data, headers=HEADERS, timeout=180,
     )
@@ -492,7 +493,7 @@ def poll_job(job_id):
 
     last_status = None
     for attempt in range(1, POLL_MAX_ATTEMPTS + 1):
-        resp = httpx.get(
+        resp = pyai_usage.get(
             f"{BASE_URL}/v1/transcription/jobs/{job_id}", headers=HEADERS, timeout=30
         )
         if resp.status_code != 200:
@@ -520,7 +521,7 @@ def get_result(job_data):
     if job_data.get("result"):
         return job_data["result"]
     if job_data.get("result_url"):
-        r = httpx.get(job_data["result_url"], timeout=30)
+        r = pyai_usage.get(job_data["result_url"], timeout=30)
         r.raise_for_status()
         return r.json()
     raise RuntimeError(f"Completed job has no result or result_url: {job_data}")

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from logging.handlers import RotatingFileHandler
 
 LOG_DIR = "logs"
@@ -17,6 +18,14 @@ MAX_BYTES = 5 * 1024 * 1024  # 5 MB
 BACKUP_COUNT = 5
 
 _CONFIGURED = False
+
+# Redact secrets before serving logs to the UI.
+_SECRET_PATTERNS = [
+    re.compile(r"(?i)\b(pyai_live_|pyai_test_)[A-Za-z0-9._\-]{8,}"),
+    re.compile(r"(?i)\b(sk-ant-|sk-)[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"(?i)(authorization|x-api-key|api[_-]?key)\s*[:=]\s*['\"]?[^\s'\"]+"),
+    re.compile(r"(?i)bearer\s+[A-Za-z0-9\-._~+/]+=*"),
+]
 
 
 def setup_logging(level: int = logging.INFO) -> str:
@@ -74,3 +83,63 @@ def event(logger: logging.Logger, name: str, level: int = logging.INFO, **fields
     for key in sorted(fields):
         parts.append(f"{key}={_fmt_value(fields[key])}")
     logger.log(level, " ".join(parts))
+
+
+def redact_line(line: str) -> str:
+    """Strip API keys / bearer tokens from a log line for UI display."""
+    text = line or ""
+    for pat in _SECRET_PATTERNS:
+        text = pat.sub("[REDACTED]", text)
+    return text
+
+
+def read_tail(lines: int = 200, path: str | None = None) -> dict:
+    """
+    Return the last N lines of the CallProof log file (redacted).
+    Same content the terminal file logger receives for callproof.* loggers.
+    """
+    n = max(1, min(int(lines or 200), 2000))
+    log_path = os.path.abspath(path or LOG_FILE)
+    if not os.path.isfile(log_path):
+        return {
+            "ok": False,
+            "path": log_path,
+            "lines": [],
+            "count": 0,
+            "error": "log_file_missing",
+            "message": "No log file yet — make an API request first.",
+        }
+
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            block = 8192
+            data = b""
+            while size > 0 and data.count(b"\n") <= n:
+                read_size = min(block, size)
+                size -= read_size
+                f.seek(size)
+                data = f.read(read_size) + data
+            text = data.decode("utf-8", errors="replace")
+    except OSError as e:
+        return {
+            "ok": False,
+            "path": log_path,
+            "lines": [],
+            "count": 0,
+            "error": "read_failed",
+            "message": str(e),
+        }
+
+    raw_lines = text.splitlines()
+    if len(raw_lines) > n:
+        raw_lines = raw_lines[-n:]
+    safe = [redact_line(ln) for ln in raw_lines]
+    return {
+        "ok": True,
+        "path": log_path,
+        "lines": safe,
+        "count": len(safe),
+        "requested": n,
+    }

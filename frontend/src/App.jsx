@@ -180,8 +180,16 @@ export default function App() {
   const [showLibrary, setShowLibrary] = useState(false);
   const [manualReviewFlagged, setManualReviewFlagged] = useState(false);
   const [manualReviewMessage, setManualReviewMessage] = useState(null);
+  const [pyaiStatus, setPyaiStatus] = useState(null);
+  const [showDevLogs, setShowDevLogs] = useState(false);
+  const [devLogLines, setDevLogLines] = useState([]);
+  const [devLogUsage, setDevLogUsage] = useState(null);
+  const [devLogError, setDevLogError] = useState(null);
+  const [devLogLoading, setDevLogLoading] = useState(false);
   const audioRef = useRef(null);
   const fileInputRef = useRef(null);
+  const devLogBodyRef = useRef(null);
+  const devLogStickRef = useRef(true);
 
   function refreshCalls() {
     return fetch(`${API}/api/calls`)
@@ -192,6 +200,43 @@ export default function App() {
       });
   }
 
+  function refreshPyaiStatus() {
+    return fetch(`${API}/api/pyai/status`)
+      .then((r) => r.json())
+      .then((data) => {
+        setPyaiStatus(data);
+        return data;
+      })
+      .catch(() => {
+        setPyaiStatus({
+          ok: false,
+          healthy: false,
+          label: "PyAI",
+          quota_label: "Status unavailable",
+        });
+      });
+  }
+
+  function refreshDevLogs() {
+    setDevLogLoading(true);
+    return fetch(`${API}/api/dev/logs?lines=300`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (!data.ok && data.error) {
+          setDevLogError(data.message || data.error);
+        } else {
+          setDevLogError(null);
+        }
+        setDevLogLines(Array.isArray(data.lines) ? data.lines : []);
+        setDevLogUsage(data.usage || null);
+        return data;
+      })
+      .catch((e) => {
+        setDevLogError(e.message || "Could not load logs.");
+      })
+      .finally(() => setDevLogLoading(false));
+  }
+
   useEffect(() => {
     refreshCalls()
       .then((data) => {
@@ -200,7 +245,29 @@ export default function App() {
       .catch(() =>
         setError("Could not reach the backend. Is uvicorn running on port 8000?")
       );
+    refreshPyaiStatus();
+    const id = setInterval(() => {
+      refreshPyaiStatus();
+    }, 15000);
+    return () => clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    if (!showDevLogs) return undefined;
+    devLogStickRef.current = true;
+    refreshDevLogs();
+    const id = setInterval(() => {
+      refreshDevLogs();
+    }, 2000);
+    return () => clearInterval(id);
+  }, [showDevLogs]);
+
+  useEffect(() => {
+    if (!showDevLogs) return;
+    const el = devLogBodyRef.current;
+    if (!el || !devLogStickRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [devLogLines, showDevLogs]);
 
   function loadAudit(id) {
     setLoading(true);
@@ -1012,6 +1079,38 @@ export default function App() {
           <span className="tagline">Call QA · PyAI</span>
         </div>
         <div className="topbar-actions">
+          {pyaiStatus && (
+            <div
+              className={`pyai-quota-chip ${pyaiStatus.healthy ? "is-ok" : "is-warn"}`}
+              title={
+                [
+                  pyaiStatus.usage_label,
+                  pyaiStatus.limits
+                    ? `rps ${pyaiStatus.limits.rps ?? "—"} · burst ${pyaiStatus.limits.burst ?? "—"} · concurrency ${pyaiStatus.limits.concurrency ?? "—"}`
+                    : null,
+                  "Counts are CallProof outbound API hits today (UTC).",
+                ]
+                  .filter(Boolean)
+                  .join(" · ")
+              }
+              role="status"
+              data-env={pyaiStatus.env || ""}
+            >
+              <span
+                className={`pyai-quota-light ${pyaiStatus.healthy ? "on" : "off"}`}
+                aria-hidden="true"
+              />
+              <span className="pyai-quota-env">
+                {(pyaiStatus.label || "PyAI").toUpperCase()}
+              </span>
+              <span className="pyai-quota-sep" aria-hidden="true">
+                ·
+              </span>
+              <span className="pyai-quota-text">
+                {pyaiStatus.quota_label || "—"}
+              </span>
+            </div>
+          )}
           <button
             type="button"
             className={`library-toggle ${showLibrary ? "on" : ""}`}
@@ -1284,6 +1383,70 @@ export default function App() {
           />
         </footer>
       )}
+
+      <div className={`dev-logs-fab-wrap${showDevLogs ? " open" : ""}`}>
+        {showDevLogs && (
+          <div className="dev-logs-popup" role="dialog" aria-label="Developer logs">
+            <div className="dev-logs-head">
+              <div>
+                <h2 className="dev-logs-title">Dev logs</h2>
+                <p className="dev-logs-sub">Live · secrets redacted</p>
+              </div>
+              <div className="dev-logs-actions">
+                <button
+                  type="button"
+                  className="library-refresh"
+                  disabled={devLogLoading}
+                  onClick={() => refreshDevLogs()}
+                >
+                  {devLogLoading ? "…" : "Refresh"}
+                </button>
+                <button
+                  type="button"
+                  className="library-refresh"
+                  onClick={() => setShowDevLogs(false)}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+            {devLogUsage && (
+              <div className="dev-logs-usage">
+                Today: {devLogUsage.total_actions ?? 0} PyAI ·{" "}
+                {devLogUsage.total_polls ?? 0} polls ·{" "}
+                {devLogUsage.by_provider?.anthropic?.hits ?? 0} Claude
+                {devLogUsage.total_units
+                  ? ` · ${devLogUsage.total_units} units`
+                  : ""}
+              </div>
+            )}
+            {devLogError && <div className="banner error">{devLogError}</div>}
+            <pre
+              className="dev-logs-body"
+              ref={devLogBodyRef}
+              onScroll={(e) => {
+                const el = e.currentTarget;
+                const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+                devLogStickRef.current = dist < 48;
+              }}
+            >
+              {devLogLines.length === 0
+                ? "No log lines yet."
+                : devLogLines.join("\n")}
+            </pre>
+          </div>
+        )}
+        <button
+          type="button"
+          className={`dev-logs-fab${showDevLogs ? " on" : ""}`}
+          onClick={() => setShowDevLogs((v) => !v)}
+          title={showDevLogs ? "Hide Dev logs" : "Open Dev logs"}
+          aria-expanded={showDevLogs}
+          aria-label={showDevLogs ? "Hide Dev logs" : "Open Dev logs"}
+        >
+          Logs
+        </button>
+      </div>
     </div>
   );
 }

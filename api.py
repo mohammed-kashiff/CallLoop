@@ -48,6 +48,7 @@ import qa_engine as qa
 import transcribe
 import recap as pyai_recap
 import email_notify
+import pyai_usage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -286,6 +287,7 @@ def _startup():
         if "filename" not in call_cols:
             c.execute("ALTER TABLE calls ADD COLUMN filename TEXT")
     os.makedirs(AUDIO_DIR, exist_ok=True)
+    pyai_usage.init_usage_db(DB_PATH)
     log.info("startup complete; db=%s audit_mode=%s claude_model=%s", DB_PATH, qa.audit_mode(), qa.MODEL)
 
 
@@ -501,6 +503,186 @@ def _weak_from_findings(findings):
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+@app.get("/api/pyai/status")
+def pyai_status():
+    """
+    Safe PyAI key posture + local CallProof usage counters for the UI.
+    Never returns the API key. Usage is CallProof-recorded outbound hits
+    (PyAI does not publish a remaining-request counter).
+    """
+    def _snapshot():
+        usage = pyai_usage.usage_summary()
+        pyai_u = (usage.get("by_provider") or {}).get("pyai") or {}
+        claude_u = (usage.get("by_provider") or {}).get("anthropic") or {}
+        return usage, {
+            "pyai_hits": int(pyai_u.get("hits") or 0),
+            "pyai_actions": int(pyai_u.get("actions") or 0),
+            "pyai_polls": int(pyai_u.get("polls") or 0),
+            "pyai_units": float(pyai_u.get("units") or 0),
+            "claude_hits": int(claude_u.get("hits") or 0),
+        }
+
+    def _chip_text(stats, balance_label=None):
+        bits = [f"{stats['pyai_actions']} PyAI"]
+        if stats["pyai_polls"]:
+            bits.append(f"{stats['pyai_polls']} polls")
+        bits.append(f"{stats['claude_hits']} Claude")
+        if stats["pyai_units"]:
+            bits.append(f"{stats['pyai_units']:g} units")
+        if balance_label:
+            bits.append(balance_label)
+        return " · ".join(bits)
+
+    def _pack(usage, stats, **extra):
+        parts = []
+        if stats["pyai_hits"]:
+            parts.append(
+                f"PyAI {stats['pyai_actions']} calls / {stats['pyai_hits']} hits"
+            )
+        else:
+            parts.append("PyAI 0 hits today")
+        if stats["claude_hits"]:
+            parts.append(f"Claude {stats['claude_hits']}")
+        if stats["pyai_units"]:
+            parts.append(f"{stats['pyai_units']:g} units")
+        out = {
+            "usage": usage,
+            "usage_label": " · ".join(parts),
+            **stats,
+        }
+        out.update(extra)
+        return out
+
+    key = (transcribe.PYAI_API_KEY or os.environ.get("PYAI_API_KEY") or "").strip()
+    if not key:
+        usage, stats = _snapshot()
+        return _pack(
+            usage, stats,
+            ok=False,
+            configured=False,
+            env=None,
+            label="No key",
+            status="missing",
+            quota_label=_chip_text(stats, "Add PYAI_API_KEY"),
+            healthy=False,
+        )
+
+    kind = "sandbox" if key.startswith("pyai_test_") else "live"
+    try:
+        r = pyai_usage.get(
+            f"{transcribe.BASE_URL}/v1/me",
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=15.0,
+        )
+    except httpx.HTTPError as e:
+        log.warning("pyai /v1/me failed: %s", e)
+        usage, stats = _snapshot()
+        return _pack(
+            usage, stats,
+            ok=False,
+            configured=True,
+            env="test" if kind == "sandbox" else "live",
+            label="Sandbox" if kind == "sandbox" else "Live",
+            status="unreachable",
+            quota_label=_chip_text(stats, "Could not reach PyAI"),
+            healthy=False,
+            error="unreachable",
+        )
+
+    usage, stats = _snapshot()
+
+    if r.status_code == 401:
+        return _pack(
+            usage, stats,
+            ok=False,
+            configured=True,
+            env="test" if kind == "sandbox" else "live",
+            label="Sandbox" if kind == "sandbox" else "Live",
+            status="unauthorized",
+            quota_label=_chip_text(stats, "Key invalid or revoked"),
+            healthy=False,
+            error="unauthorized",
+        )
+
+    if r.status_code != 200:
+        return _pack(
+            usage, stats,
+            ok=False,
+            configured=True,
+            env="test" if kind == "sandbox" else "live",
+            label="Sandbox" if kind == "sandbox" else "Live",
+            status="error",
+            quota_label=_chip_text(stats, f"HTTP {r.status_code}"),
+            healthy=False,
+            error=f"http_{r.status_code}",
+        )
+
+    body = r.json() if r.content else {}
+    env = (body.get("env") or ("test" if kind == "sandbox" else "live")).lower()
+    is_sandbox = env == "test" or kind == "sandbox"
+    label = "Sandbox" if is_sandbox else "Live"
+    limits = body.get("limits") or {}
+    key_status = body.get("status") or "unknown"
+    healthy = key_status == "active" and (body.get("org_status") or "active") == "active"
+
+    daily_cap = limits.get("daily_unit_cap")
+    if is_sandbox:
+        # Sandbox is not billed; optional daily unit cap only (not prepaid $).
+        balance_label = (
+            f"cap {daily_cap} u/day" if daily_cap is not None else "not billed"
+        )
+        quota_kind = "sandbox_daily"
+        quota_value = daily_cap
+    else:
+        # Live: show local usage only — do not surface prepaid credit balance.
+        balance_label = None
+        quota_kind = "live_usage"
+        quota_value = None
+
+    return _pack(
+        usage, stats,
+        ok=True,
+        configured=True,
+        env=env,
+        label=label,
+        status=key_status,
+        org_status=body.get("org_status"),
+        plan=body.get("plan"),
+        healthy=healthy,
+        quota_kind=quota_kind,
+        quota_label=_chip_text(stats, balance_label),
+        quota_value=quota_value,
+        balance_label=balance_label,
+        limits={
+            "rps": limits.get("rps"),
+            "burst": limits.get("burst"),
+            "concurrency": limits.get("concurrency"),
+            "daily_unit_cap": daily_cap,
+            "monthly_units": limits.get("monthly_units"),
+        },
+    )
+
+
+@app.get("/api/dev/logs")
+def dev_logs(lines: int = 200):
+    """
+    Tail CallProof's rotating app log (logs/callproof.log) for the Dev Logs UI.
+    Secrets are redacted. Same structured events as the terminal callproof.* stream.
+    """
+    payload = applog.read_tail(lines=lines)
+    usage = pyai_usage.usage_summary()
+    payload["usage"] = {
+        "total_hits": usage.get("total_hits"),
+        "total_actions": usage.get("total_actions"),
+        "total_polls": usage.get("total_polls"),
+        "total_units": usage.get("total_units"),
+        "by_provider": usage.get("by_provider"),
+        "top_paths": usage.get("top_paths"),
+        "window": usage.get("window"),
+    }
+    return payload
+
+
 @app.get("/api/calls")
 def list_calls():
     """

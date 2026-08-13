@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 import rules
 import qa_v8
 import applog
+import pyai_usage
 
 load_dotenv()
 applog.setup_logging()
@@ -350,8 +351,9 @@ def call_claude(prompt):
     started = time.perf_counter()
     for attempt in range(1, MAX_HTTP_RETRIES + 1):
         try:
-            resp = httpx.post(
+            resp = pyai_usage.post(
                 "https://api.anthropic.com/v1/messages",
+                provider="anthropic",
                 headers={"x-api-key": ANTHROPIC_API_KEY,
                          "anthropic-version": "2023-06-01",
                          "content-type": "application/json"},

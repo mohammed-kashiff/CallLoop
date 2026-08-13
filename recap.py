@@ -17,6 +17,7 @@ import httpx
 from dotenv import load_dotenv
 
 import applog
+import pyai_usage
 
 load_dotenv()
 applog.setup_logging()
@@ -114,7 +115,7 @@ def _normalize(payload: dict) -> dict:
 
 def get_recap(pyai_call_id: str):
     """GET /v1/recap/calls/{id}. Returns (status_code, json_or_none)."""
-    resp = httpx.get(
+    resp = pyai_usage.get(
         f"{BASE_URL}/v1/recap/calls/{pyai_call_id}",
         headers=HEADERS,
         timeout=30,
@@ -133,7 +134,7 @@ def trigger_recap(pyai_call_id: str, utterances, audio_seconds=None):
         body["call_duration_s"] = float(audio_seconds)
     if RECAP_PACK_ID:
         body["pack_id"] = RECAP_PACK_ID
-    resp = httpx.post(
+    resp = pyai_usage.post(
         f"{BASE_URL}/v1/recap/calls/{pyai_call_id}",
         headers={**HEADERS, "Content-Type": "application/json"},
         json=body,
