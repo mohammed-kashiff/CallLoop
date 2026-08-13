@@ -933,11 +933,71 @@ button {
   margin: 4px 0 6px;
 }
 
+.finding-why {
+  margin: 0 0 8px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--text-soft);
+}
+
+.finding-why-label {
+  display: block;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
 .finding-reason {
   margin: 0 0 8px;
   font-size: 13.5px;
   line-height: 1.5;
   color: var(--text-soft);
+}
+
+.subchecks {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.subcheck {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.subcheck-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.subcheck-name {
+  font-weight: 650;
+  font-size: 12.5px;
+}
+
+.subcheck-reason {
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-soft);
+}
+
+.subcheck-quote {
+  font-size: 12px;
+  color: var(--muted);
+  font-style: italic;
 }
 
 .badge {
@@ -1058,6 +1118,22 @@ button {
 /* ---------- Feedback ---------- */
 
 .customer-feedback { margin-top: 4px; }
+
+.customer-feedback .h {
+  margin-top: 0;
+  border-top: none;
+  padding-top: 0;
+}
+
+.feedback-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 22px 0 10px;
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+}
 
 .fb-grid {
   display: grid;

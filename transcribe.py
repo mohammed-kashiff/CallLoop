@@ -7,6 +7,8 @@ transcribed once (cached by content hash). On a failed job, PyAI's actual error
 is logged and raised - no more silent failures.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import time
@@ -15,6 +17,8 @@ import logging
 import sqlite3
 import hashlib
 import uuid
+import shutil
+import subprocess
 
 import httpx
 from dotenv import load_dotenv
@@ -43,6 +47,13 @@ MODEL = "pyai-hear-telephony"
 POLL_INTERVAL_SECONDS = 2
 POLL_MAX_ATTEMPTS = 60
 
+# Telephony-sized copy for PyAI Hear only. Playback still uses the original file.
+# Must stay discrete-channel PCM (not MP3). Joint-stereo MP3 mixes L/R, and
+# Hear channel=true then returns no speaker labels.
+HEAR_SAMPLE_RATE = 8000
+HEAR_CHANNELS = 2
+HEAR_FFMPEG_TIMEOUT = 60
+
 # Populated at import; may be refreshed by set_api_key() after sandbox mint.
 HEADERS = {"Authorization": f"Bearer {PYAI_API_KEY}"} if PYAI_API_KEY else {}
 
@@ -69,6 +80,169 @@ def _require_api_key():
 
 def is_url(src):
     return src.startswith("http://") or src.startswith("https://")
+
+
+def _ffmpeg_bin():
+    """System ffmpeg, FFMPEG_PATH, or imageio-ffmpeg's bundled binary."""
+    env = (os.getenv("FFMPEG_PATH") or "").strip()
+    if env and os.path.isfile(env) and os.access(env, os.X_OK):
+        return env
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    for path in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+    if exe and os.path.isfile(exe) and os.access(exe, os.X_OK):
+        return exe
+    return None
+
+
+def _run_ffmpeg(ffmpeg, src_path, dest_path):
+    # 8 kHz stereo PCM keeps agent/customer on separate channels.
+    # Do not encode MP3/AAC: joint stereo bleeds L/R and Hear drops speakers.
+    return subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostdin",
+            "-y",
+            "-i", src_path,
+            "-map", "0:a:0",
+            "-ac", str(HEAR_CHANNELS),
+            "-ar", str(HEAR_SAMPLE_RATE),
+            "-c:a", "pcm_s16le",
+            "-f", "wav",
+            dest_path,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=HEAR_FFMPEG_TIMEOUT,
+        check=False,
+    )
+
+
+def is_hear_wav(path):
+    """True if path is already an 8 kHz stereo PCM WAV (browser bulk Hear copy)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(44)
+    except OSError:
+        return False
+    if len(head) < 44 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+        return False
+    fmt_at = head.find(b"fmt ")
+    if fmt_at < 0 or fmt_at + 16 > len(head):
+        return False
+    audio_format = int.from_bytes(head[fmt_at + 8:fmt_at + 10], "little")
+    channels = int.from_bytes(head[fmt_at + 10:fmt_at + 12], "little")
+    rate = int.from_bytes(head[fmt_at + 12:fmt_at + 16], "little")
+    return audio_format == 1 and channels == HEAR_CHANNELS and rate == HEAR_SAMPLE_RATE
+
+
+def make_hear_copy(src_path, dest_path):
+    """
+    Encode a smaller 8 kHz stereo PCM WAV for PyAI Hear (channel mode).
+
+    Returns dest_path if the copy exists and is strictly smaller than src.
+    Returns None if ffmpeg is missing, transcode fails, or there is no size
+    win (typical for recordings that are already 8 kHz stereo WAV). Never
+    modifies src_path — playback should keep the original.
+    """
+    if not src_path or not os.path.isfile(src_path):
+        return None
+    original_bytes = os.path.getsize(src_path)
+    if original_bytes <= 0:
+        return None
+
+    ffmpeg = _ffmpeg_bin()
+    if not ffmpeg:
+        applog.event(
+            log, "transcode_skipped",
+            reason="ffmpeg_missing",
+            original_bytes=original_bytes,
+        )
+        log.info(
+            "Hear transcode skipped (no ffmpeg). Install ffmpeg or "
+            "pip install imageio-ffmpeg. Uploading the original file."
+        )
+        return None
+
+    dest_dir = os.path.dirname(dest_path) or "."
+    os.makedirs(dest_dir, exist_ok=True)
+    if os.path.exists(dest_path):
+        os.remove(dest_path)
+
+    started = time.perf_counter()
+    last_err = None
+    try:
+        proc = _run_ffmpeg(ffmpeg, src_path, dest_path)
+        if proc.returncode == 0 and os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0:
+            last_err = None
+        else:
+            err = (proc.stderr or proc.stdout or "").strip().replace("\n", " ")[:200]
+            last_err = err or f"ffmpeg exit {proc.returncode}"
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        last_err = f"{type(e).__name__}: {e}"
+        log.warning("Hear transcode failed: %s", last_err)
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+
+    duration_ms = round((time.perf_counter() - started) * 1000, 1)
+    if last_err or not os.path.isfile(dest_path):
+        applog.event(
+            log, "transcode_skipped",
+            reason="ffmpeg_failed",
+            original_bytes=original_bytes,
+            duration_ms=duration_ms,
+            error=last_err or "no_output",
+        )
+        log.warning(
+            "Hear transcode failed (%s); uploading the original file",
+            last_err or "no_output",
+        )
+        return None
+
+    hear_bytes = os.path.getsize(dest_path)
+    if hear_bytes >= original_bytes:
+        os.remove(dest_path)
+        applog.event(
+            log, "transcode_skipped",
+            reason="no_savings",
+            original_bytes=original_bytes,
+            hear_bytes=hear_bytes,
+            duration_ms=duration_ms,
+        )
+        log.info(
+            "Hear copy not smaller (%d -> %d bytes); "
+            "uploading original to preserve L/R channels",
+            original_bytes, hear_bytes,
+        )
+        return None
+
+    applog.event(
+        log, "transcode_success",
+        original_bytes=original_bytes,
+        hear_bytes=hear_bytes,
+        duration_ms=duration_ms,
+        saved_bytes=original_bytes - hear_bytes,
+    )
+    log.info(
+        "Hear copy %d -> %d bytes (%.1f%% smaller) in %.0f ms (8 kHz stereo PCM)",
+        original_bytes,
+        hear_bytes,
+        (1 - hear_bytes / original_bytes) * 100,
+        duration_ms,
+    )
+    return dest_path
 
 
 # ---------- Database ----------
@@ -373,14 +547,24 @@ def main():
         log.info("already transcribed (call id %d) - loading from DB, no API call", existing[0])
         return
     pyai_id = new_pyai_call_id()
-    job_id = submit_job_url(src, call_id=pyai_id) if is_url(src) else submit_job_file(src, call_id=pyai_id)
-    result = poll_job(job_id)
-    call_id = save_transcript(
-        conn, identity, job_id, result,
-        pyai_call_id=pyai_id,
-        filename=None if is_url(src) else os.path.basename(src),
-    )
-    log.info("done: call id %d", call_id)
+    hear_tmp = None
+    try:
+        if is_url(src):
+            job_id = submit_job_url(src, call_id=pyai_id)
+        else:
+            hear_tmp = src + ".hear-tmp.wav"
+            upload_path = make_hear_copy(src, hear_tmp) or src
+            job_id = submit_job_file(upload_path, call_id=pyai_id)
+        result = poll_job(job_id)
+        call_id = save_transcript(
+            conn, identity, job_id, result,
+            pyai_call_id=pyai_id,
+            filename=None if is_url(src) else os.path.basename(src),
+        )
+        log.info("done: call id %d", call_id)
+    finally:
+        if hear_tmp and os.path.exists(hear_tmp):
+            os.remove(hear_tmp)
 
 
 if __name__ == "__main__":

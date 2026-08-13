@@ -14,6 +14,8 @@ CallProof QA needs speaker-labelled async Hear jobs — use a live key for the
 full stack. Sandbox minting is a bootstrap aid, not a production substitute.
 """
 
+from __future__ import annotations
+
 import os
 import csv
 import io
@@ -22,7 +24,11 @@ import hashlib
 import logging
 import sqlite3
 import time
-from concurrent.futures import ThreadPoolExecutor
+import uuid
+import shutil
+import zipfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import httpx
@@ -53,6 +59,10 @@ log = logging.getLogger("callproof.api")
 DB_PATH = qa.DB_PATH
 AUDIO_DIR = "audio"
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_BULK_FILES = 20
+MAX_BATCH_ZIP_BYTES = MAX_UPLOAD_BYTES * MAX_BULK_FILES
+AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm", ".mpeg", ".mpga", ".aac"}
+_db_lock = threading.Lock()
 
 PYAI_SANDBOX_MINT_URL = "https://api.pyai.com/v1/sandbox/keys"
 ENV_FILE = ".env"
@@ -100,7 +110,7 @@ async def log_http(request: Request, call_next):
 
 
 def _conn():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
     return c
 
@@ -276,7 +286,7 @@ def _startup():
         if "filename" not in call_cols:
             c.execute("ALTER TABLE calls ADD COLUMN filename TEXT")
     os.makedirs(AUDIO_DIR, exist_ok=True)
-    log.info("startup complete; db=%s", DB_PATH)
+    log.info("startup complete; db=%s audit_mode=%s claude_model=%s", DB_PATH, qa.audit_mode(), qa.MODEL)
 
 
 _startup()
@@ -285,7 +295,14 @@ _startup()
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _rubric_hash():
     with open(qa.RUBRIC_PATH, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()[:16]
+        body = f.read()
+    # Bust cache when scoring policy changes (hybrid vs full).
+    body += (
+        f"\naudit_mode={qa.audit_mode()}\nrole=channel\nmodel={qa.MODEL}\n"
+        f"claude_effort={getattr(qa, 'CLAUDE_EFFORT', 'high')}\n"
+        f"rules_rev=own_emp_pro_scope_v1\n"
+    ).encode("utf-8")
+    return hashlib.sha256(body).hexdigest()[:16]
 
 
 def _call_filename(call_id: int) -> str:
@@ -336,24 +353,25 @@ def analyze_call(call_id, agent_override=None):
     with open(qa.RUBRIC_PATH) as f:
         rubric = json.load(f)
 
+    mode = qa.audit_mode()
     is_v8 = qa_v8.is_v8_rubric(rubric)
     if is_v8:
         n_items = len(qa_v8.list_dimensions(rubric))
         log.info(
-            "computing audit for call %d (%d v8 dimensions) — parallel Claude wave",
-            call_id, n_items,
+            "computing audit for call %d (%d v8 dimensions, mode=%s)",
+            call_id, n_items, mode,
         )
         criteria_arg = []
     else:
         n_items = len(rubric["criteria"])
         log.info(
-            "computing audit for call %d (%d criteria) — parallel Claude wave",
-            call_id, n_items,
+            "computing audit for call %d (%d criteria, mode=%s)",
+            call_id, n_items, mode,
         )
         criteria_arg = rubric["criteria"]
 
-    # One parallel wave: dimensions/criteria + churn + feedback + Recap.
-    # Retention email + coaching tips are on-demand (button / compose).
+    # One parallel wave: dimensions/criteria + churn + Recap.
+    # Retention email, coaching tips, and customer feedback are on-demand.
     with ThreadPoolExecutor(max_workers=2) as pool:
         wave_f = pool.submit(
             qa.run_parallel_claude_wave,
@@ -398,6 +416,11 @@ def analyze_call(call_id, agent_override=None):
                 "id": cr["id"], "name": cr["name"], "method": cr["method"],
                 "weight": cr["weight"], "is_gate": bool(cr.get("is_gate")),
                 "verdict": res["verdict"], "reasoning": res.get("reasoning", ""),
+                "why": (
+                    f"{cr['name']}: {(res.get('verdict') or '').title()} — "
+                    f"{qa.awarded_points(cr, res['verdict']) if qa.awarded_points(cr, res['verdict']) is not None else '—'} "
+                    f"of {cr['weight']} points. {(res.get('reasoning') or '').strip()}"
+                ).strip(),
                 "points": qa.awarded_points(cr, res["verdict"]),
                 "evidence_text": res.get("evidence_text"),
                 "evidence_seq": res.get("evidence_seq"),
@@ -417,6 +440,8 @@ def analyze_call(call_id, agent_override=None):
         recap_status=(call_recap or {}).get("status"),
         flagged=flagged,
         manager_review_count=len(manager_review),
+        audit_mode=qa.audit_mode(),
+        agent_speaker=agent,
     )
 
     return {
@@ -432,6 +457,7 @@ def analyze_call(call_id, agent_override=None):
         "coaching": [],
         "churn": churn, "feedback": feedback,
         "retention_email": retention_email, "recap": call_recap,
+        "audit_mode": qa.audit_mode(),
     }
 
 
@@ -439,20 +465,22 @@ def _load_or_compute_audit(call_id: int, refresh: bool = False):
     """Return (audit_dict, rubric_hash). Computes and caches on miss/refresh."""
     rh = _rubric_hash()
     if not refresh:
-        with _conn() as c:
-            row = c.execute(
-                "SELECT audit_json, rubric_hash FROM audits WHERE call_id=?",
-                (call_id,),
-            ).fetchone()
+        with _db_lock:
+            with _conn() as c:
+                row = c.execute(
+                    "SELECT audit_json, rubric_hash FROM audits WHERE call_id=?",
+                    (call_id,),
+                ).fetchone()
         if row and row["rubric_hash"] == rh:
             return json.loads(row["audit_json"]), rh
     audit = analyze_call(call_id)
-    with _conn() as c:
-        c.execute(
-            "INSERT OR REPLACE INTO audits (call_id, audit_json, rubric_hash) "
-            "VALUES (?, ?, ?)",
-            (call_id, json.dumps(audit), rh),
-        )
+    with _db_lock:
+        with _conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO audits (call_id, audit_json, rubric_hash) "
+                "VALUES (?, ?, ?)",
+                (call_id, json.dumps(audit), rh),
+            )
     return audit, rh
 
 
@@ -769,6 +797,47 @@ def post_coaching(call_id: int):
     return {"call_id": call_id, "coaching": coaching}
 
 
+@app.post("/api/calls/{call_id}/feedback")
+def post_feedback(call_id: int):
+    """On-demand agent/product feedback (one Claude call). Cached after first success."""
+    audit, rh = _load_or_compute_audit(call_id, refresh=False)
+    existing = audit.get("feedback") or {}
+    if existing.get("status") == "ok":
+        log.info("on-demand feedback cache HIT for call %d", call_id)
+        applog.event(log, "feedback_cache", result="HIT", call_id=call_id)
+        return {"call_id": call_id, "feedback": existing}
+
+    _cid, _meta, segments = qa.load_call(call_id)
+    if not segments:
+        audit["feedback"] = {
+            "status": "error",
+            "error": "No transcript segments available for feedback.",
+            "agent": [],
+            "product": [],
+        }
+        _save_audit(call_id, audit, rh)
+        applog.event(
+            log, "feedback_failure", level=logging.ERROR,
+            call_id=call_id, error="no_segments",
+        )
+        return {"call_id": call_id, "feedback": audit["feedback"]}
+
+    agent = audit.get("agent_speaker") or qa.classify_roles(segments)
+    transcript_text = qa.format_transcript(segments, agent)
+    log.info("on-demand feedback for call %d", call_id)
+    feedback = qa.extract_feedback(transcript_text, segments)
+    audit["feedback"] = feedback
+    _save_audit(call_id, audit, rh)
+    applog.event(
+        log, "feedback_success" if feedback.get("status") == "ok" else "feedback_failure",
+        call_id=call_id,
+        agent_items=len(feedback.get("agent") or []),
+        product_items=len(feedback.get("product") or []),
+        status=feedback.get("status"),
+    )
+    return {"call_id": call_id, "feedback": feedback}
+
+
 @app.get("/api/calls/{call_id}/stakeholder-email/compose")
 def get_stakeholder_email_compose(call_id: int):
     """
@@ -806,6 +875,190 @@ def get_stakeholder_email_compose(call_id: int):
     }
 
 
+def _ingest_audio_file(src_path: str, source_name: str) -> tuple[int, bool]:
+    """
+    Dedup or transcribe one local audio file. Hear temp is unique per src_path.
+    Returns (call_id, deduped). Caller stores the playback copy.
+    """
+    source_name = transcribe.sanitize_filename(source_name)
+    identity = transcribe.identity_for(src_path)
+    size = os.path.getsize(src_path)
+    hear_tmp = f"{src_path}.{uuid.uuid4().hex}.hear.wav"
+
+    try:
+        with _db_lock:
+            conn = sqlite3.connect(DB_PATH, timeout=30)
+            try:
+                existing = transcribe.find_existing_call(conn, identity)
+                if existing:
+                    call_id = existing[0]
+                    transcribe.set_filename_if_empty(conn, call_id, source_name)
+                    applog.event(
+                        log, "transcription_success",
+                        call_id=call_id, deduped=True, size_bytes=size,
+                        filename=source_name,
+                    )
+                    log.info(
+                        "upload deduped to existing call %d (no re-transcription)",
+                        call_id,
+                    )
+                    return call_id, True
+            finally:
+                conn.close()
+
+        pyai_id = transcribe.new_pyai_call_id()
+        if transcribe.is_hear_wav(src_path):
+            upload_path = src_path
+        else:
+            upload_path = transcribe.make_hear_copy(src_path, hear_tmp) or src_path
+        job_id = transcribe.submit_job_file(upload_path, call_id=pyai_id)
+        result = transcribe.poll_job(job_id)
+        with _db_lock:
+            conn = sqlite3.connect(DB_PATH, timeout=30)
+            try:
+                existing = transcribe.find_existing_call(conn, identity)
+                if existing:
+                    call_id = existing[0]
+                    transcribe.set_filename_if_empty(conn, call_id, source_name)
+                    return call_id, True
+                try:
+                    call_id = transcribe.save_transcript(
+                        conn, identity, job_id, result,
+                        pyai_call_id=pyai_id,
+                        filename=source_name,
+                    )
+                except sqlite3.IntegrityError:
+                    existing = transcribe.find_existing_call(conn, identity)
+                    if not existing:
+                        raise
+                    call_id = existing[0]
+                    transcribe.set_filename_if_empty(conn, call_id, source_name)
+                    return call_id, True
+            finally:
+                conn.close()
+        applog.event(
+            log, "transcription_success",
+            call_id=call_id,
+            pyai_call_id=pyai_id,
+            job_id=job_id,
+            segments=len(result.get("segments") or []),
+            size_bytes=size,
+            deduped=False,
+            filename=source_name,
+        )
+        log.info(
+            "transcription complete -> new call %d (filename=%s, pyai_call_id=%s)",
+            call_id, source_name, pyai_id,
+        )
+        return call_id, False
+    finally:
+        if os.path.exists(hear_tmp):
+            os.remove(hear_tmp)
+
+
+def _audio_media_type(path: str) -> str:
+    """Playback files may be original MP3s or 8 kHz Hear WAVs from bulk import."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+    except OSError:
+        return "audio/mpeg"
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "audio/wav"
+    return "audio/mpeg"
+
+
+def _store_playback(src_path: str, call_id: int):
+    dest = os.path.join(AUDIO_DIR, f"{call_id}.mp3")
+    os.makedirs(AUDIO_DIR, exist_ok=True)
+    if os.path.abspath(src_path) != os.path.abspath(dest):
+        shutil.copy2(src_path, dest)
+
+
+def _upload_error_status(msg: str) -> HTTPException:
+    if "daily_cap_exceeded" in msg:
+        return HTTPException(
+            status_code=429,
+            detail="Daily transcription cap reached (resets 00:00 UTC). "
+                   "Try a fresh key or later.",
+        )
+    if "transcribe:jobs" in msg or "speaker-labelled" in msg:
+        return HTTPException(status_code=403, detail=msg)
+    return HTTPException(status_code=502, detail=f"Transcription failed: {msg}")
+
+
+def _safe_zip_base_name(filename: str) -> str | None:
+    raw = (filename or "").replace("\\", "/")
+    if raw.startswith("/") or raw.startswith("..") or "/../" in f"/{raw}/":
+        return None
+    base = transcribe.sanitize_filename(os.path.basename(raw))
+    ext = os.path.splitext(base)[1].lower()
+    if ext == ".zip" or ext not in AUDIO_EXTS:
+        return None
+    return base
+
+
+def _extract_batch_zip(zip_path: str, batch_dir: str) -> list[dict]:
+    """Extract audio members into batch_dir. Raises HTTPException on bad zip."""
+    extracted = []
+    try:
+        zf = zipfile.ZipFile(zip_path, "r")
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="The upload was not a valid zip file.")
+
+    with zf:
+        infos = [i for i in zf.infolist() if not i.is_dir()]
+        if not infos:
+            raise HTTPException(status_code=400, detail="The zip did not contain any files.")
+        if len(infos) > MAX_BULK_FILES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Zip has too many files (max {MAX_BULK_FILES}).",
+            )
+        total_uncompressed = 0
+        batch_abs = os.path.abspath(batch_dir) + os.sep
+        for i, info in enumerate(infos):
+            name = _safe_zip_base_name(info.filename)
+            if not name:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Zip member is not an allowed audio file: {os.path.basename(info.filename)}",
+                )
+            if info.file_size > MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"{name} is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+                )
+            total_uncompressed += info.file_size
+            if total_uncompressed > MAX_BATCH_ZIP_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Uncompressed zip contents exceed the batch size limit.",
+                )
+            display = name
+            if len(name) > 3 and name[0:2].isdigit() and name[2] == "_":
+                display = name[3:] or name
+            dest = os.path.join(batch_dir, f"{i:02d}_{name}")
+            dest_abs = os.path.abspath(dest)
+            if not dest_abs.startswith(batch_abs):
+                raise HTTPException(status_code=400, detail="Invalid zip member path.")
+            copied = 0
+            with zf.open(info, "r") as src, open(dest, "wb") as out:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    copied += len(chunk)
+                    if copied > MAX_UPLOAD_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"{name} exceeded the per-file size limit while extracting.",
+                        )
+                    out.write(chunk)
+            extracted.append({"path": dest, "filename": display, "index": i})
+    return extracted
+
+
 @app.get("/api/calls/{call_id}/audio")
 def get_audio(call_id: int):
     path = os.path.join(AUDIO_DIR, f"{call_id}.mp3")
@@ -814,7 +1067,7 @@ def get_audio(call_id: int):
             status_code=404,
             detail=f"No audio at {path}. Copy the call's file there as {call_id}.mp3.",
         )
-    return FileResponse(path, media_type="audio/mpeg")
+    return FileResponse(path, media_type=_audio_media_type(path))
 
 
 @app.post("/api/upload")
@@ -848,51 +1101,14 @@ def upload(file: UploadFile = File(...)):
         )
 
     os.makedirs(AUDIO_DIR, exist_ok=True)
-    tmp = os.path.join(AUDIO_DIR, "_upload_tmp")
+    tmp = os.path.join(AUDIO_DIR, f"_upload_{uuid.uuid4().hex}")
     with open(tmp, "wb") as f:
         f.write(data)
 
     source_name = transcribe.sanitize_filename(file.filename)
 
     try:
-        identity = transcribe.identity_for(tmp)
-        conn = sqlite3.connect(DB_PATH)
-        existing = transcribe.find_existing_call(conn, identity)
-        if existing:
-            call_id = existing[0]
-            transcribe.set_filename_if_empty(conn, call_id, source_name)
-            applog.event(
-                log, "transcription_success",
-                call_id=call_id, deduped=True, size_bytes=size,
-                filename=source_name,
-            )
-            log.info(
-                "upload deduped to existing call %d (no re-transcription)", call_id
-            )
-        else:
-            pyai_id = transcribe.new_pyai_call_id()
-            job_id = transcribe.submit_job_file(tmp, call_id=pyai_id)
-            result = transcribe.poll_job(job_id)
-            call_id = transcribe.save_transcript(
-                conn, identity, job_id, result,
-                pyai_call_id=pyai_id,
-                filename=source_name,
-            )
-            applog.event(
-                log, "transcription_success",
-                call_id=call_id,
-                pyai_call_id=pyai_id,
-                job_id=job_id,
-                segments=len(result.get("segments") or []),
-                size_bytes=size,
-                deduped=False,
-                filename=source_name,
-            )
-            log.info(
-                "transcription complete -> new call %d (filename=%s, pyai_call_id=%s)",
-                call_id, source_name, pyai_id,
-            )
-        conn.close()
+        call_id, _deduped = _ingest_audio_file(tmp, source_name)
         os.replace(tmp, os.path.join(AUDIO_DIR, f"{call_id}.mp3"))
     except HTTPException:
         raise
@@ -905,17 +1121,159 @@ def upload(file: UploadFile = File(...)):
             error=msg,
         )
         log.error("upload/transcription failed: %s", msg)
-        if "daily_cap_exceeded" in msg:
-            raise HTTPException(
-                status_code=429,
-                detail="Daily transcription cap reached (resets 00:00 UTC). "
-                       "Try a fresh key or later.",
-            )
-        if "transcribe:jobs" in msg or "speaker-labelled" in msg:
-            raise HTTPException(status_code=403, detail=msg)
-        raise HTTPException(status_code=502, detail=f"Transcription failed: {msg}")
+        raise _upload_error_status(msg)
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
 
     return {"call_id": call_id, "filename": _call_filename(call_id)}
+
+
+@app.post("/api/upload-batch")
+def upload_batch(file: UploadFile = File(...)):
+    """
+    One zip of up to MAX_BULK_FILES audio files. Extract to unique paths,
+    transcribe all on PyAI in parallel, then run Claude QA in parallel.
+    """
+    data = file.file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="The uploaded zip was empty.")
+    if len(data) > MAX_BATCH_ZIP_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Zip is too large. Maximum is {MAX_BATCH_ZIP_BYTES // (1024 * 1024)} MB.",
+        )
+
+    batch_id = uuid.uuid4().hex
+    batch_dir = os.path.join(AUDIO_DIR, "batches", batch_id)
+    os.makedirs(batch_dir, exist_ok=True)
+    zip_path = os.path.join(batch_dir, "batch.zip")
+    with open(zip_path, "wb") as f:
+        f.write(data)
+
+    started = time.perf_counter()
+    try:
+        extracted = _extract_batch_zip(zip_path, batch_dir)
+        applog.event(
+            log, "batch_received",
+            count=len(extracted),
+            zip_bytes=len(data),
+            batch_id=batch_id,
+        )
+        log.info("batch %s: %d file(s), parallel transcribe then parallel QA", batch_id, len(extracted))
+
+        ingest_rows = [None] * len(extracted)
+
+        def ingest_one(item):
+            try:
+                call_id, deduped = _ingest_audio_file(item["path"], item["filename"])
+                _store_playback(item["path"], call_id)
+                return {
+                    "index": item["index"],
+                    "filename": item["filename"],
+                    "call_id": call_id,
+                    "deduped": deduped,
+                    "error": None,
+                }
+            except (Exception, SystemExit) as e:  # noqa: BLE001
+                msg = str(e)
+                applog.event(
+                    log, "transcription_failure", level=logging.ERROR,
+                    filename=item["filename"],
+                    error=msg,
+                )
+                return {
+                    "index": item["index"],
+                    "filename": item["filename"],
+                    "call_id": None,
+                    "deduped": False,
+                    "error": msg,
+                }
+
+        workers = min(MAX_BULK_FILES, max(1, len(extracted)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [pool.submit(ingest_one, item) for item in extracted]
+            for fut in as_completed(futs):
+                row = fut.result()
+                ingest_rows[row["index"]] = row
+
+        to_audit = [r for r in ingest_rows if r and r.get("call_id") and not r.get("error")]
+
+        def audit_one(row):
+            try:
+                audit, _rh = _load_or_compute_audit(row["call_id"], refresh=False)
+                return {
+                    **row,
+                    "status": "ok",
+                    "score": audit.get("score"),
+                    "grade": audit.get("grade"),
+                    "flagged": bool(audit.get("flagged")),
+                }
+            except (Exception, SystemExit) as e:  # noqa: BLE001
+                return {
+                    **row,
+                    "status": "error",
+                    "error": f"Transcribed but audit failed: {e}",
+                    "score": None,
+                    "grade": None,
+                    "flagged": False,
+                }
+
+        audited = {}
+        if to_audit:
+            with ThreadPoolExecutor(max_workers=min(MAX_BULK_FILES, len(to_audit))) as pool:
+                futs = [pool.submit(audit_one, row) for row in to_audit]
+                for fut in as_completed(futs):
+                    row = fut.result()
+                    audited[row["index"]] = row
+
+        calls = []
+        for row in ingest_rows:
+            if not row:
+                continue
+            if row.get("error") and not row.get("call_id"):
+                calls.append({
+                    "filename": row["filename"],
+                    "status": "error",
+                    "error": row["error"],
+                    "call_id": None,
+                    "score": None,
+                    "grade": None,
+                    "flagged": False,
+                    "deduped": False,
+                })
+            elif row["index"] in audited:
+                out = audited[row["index"]]
+                calls.append({
+                    "filename": out["filename"],
+                    "status": out.get("status") or "ok",
+                    "error": out.get("error"),
+                    "call_id": out.get("call_id"),
+                    "score": out.get("score"),
+                    "grade": out.get("grade"),
+                    "flagged": bool(out.get("flagged")),
+                    "deduped": bool(out.get("deduped")),
+                })
+            else:
+                calls.append({
+                    "filename": row["filename"],
+                    "status": "ok",
+                    "error": None,
+                    "call_id": row.get("call_id"),
+                    "score": None,
+                    "grade": None,
+                    "flagged": False,
+                    "deduped": bool(row.get("deduped")),
+                })
+
+        duration_ms = round((time.perf_counter() - started) * 1000, 1)
+        applog.event(
+            log, "batch_completed",
+            batch_id=batch_id,
+            count=len(calls),
+            duration_ms=duration_ms,
+        )
+        log.info("batch %s done in %.0f ms (%d call(s))", batch_id, duration_ms, len(calls))
+        return {"count": len(calls), "calls": calls}
+    finally:
+        shutil.rmtree(batch_dir, ignore_errors=True)

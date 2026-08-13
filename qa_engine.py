@@ -43,6 +43,15 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 DB_PATH = "callproof.db"
 RUBRIC_PATH = "rubric.json"
 MODEL = "claude-sonnet-5"
+CLAUDE_EFFORT = "high"
+# hybrid: channel/greeting roles; Claude for resolution + churn (parallel).
+#         Tone LLM, ownership step-2, and first-load feedback stay skipped.
+# full: same roles, plus tone LLM, ownership step-2 LLM, churn.
+# Feedback is on-demand (Get feedback), not part of the first-load wave.
+_raw_mode = (os.getenv("AUDIT_MODE") or "hybrid").strip().lower()
+AUDIT_MODE = _raw_mode if _raw_mode in ("hybrid", "full") else "hybrid"
+if _raw_mode not in ("hybrid", "full"):
+    log.warning("unknown AUDIT_MODE=%s; using hybrid", _raw_mode)
 MAX_HTTP_RETRIES = 4       # attempts per Claude call (with backoff)
 MAX_PARSE_RETRIES = 2      # re-asks if the reply isn't valid JSON
 MAX_TOKENS = 2000
@@ -78,30 +87,137 @@ def identify_agent(segments):
     return segments[0]["speaker"] if segments else None
 
 
-def classify_roles(segments):
-    """Identify the AGENT by content (who greets for a company, explains policy, handles the
-    account) rather than by turn order. Validates the answer; falls back to first speaker."""
-    speakers = sorted({s["speaker"] for s in segments if s.get("speaker")})
-    if len(speakers) < 2:
-        return speakers[0] if speakers else None
-    transcript = "\n".join(f'[{s["speaker"]}] {s["text"]}' for s in segments)
-    prompt = (
-        "Below is a call transcript with speaker labels. Exactly one speaker is the AGENT "
-        "(the company representative) and the other is the CUSTOMER. The agent greets on "
-        "behalf of a company, explains policies/processes, handles the account, and commits "
-        "to next steps.\n\n"
-        f"Speakers: {', '.join(speakers)}\n\nTRANSCRIPT:\n{transcript}\n\n"
-        'Return ONLY this JSON: {"agent_speaker": "<one of the speaker labels>", "reasoning": "<one short sentence>"}'
-    )
+def audit_mode() -> str:
+    return AUDIT_MODE
+
+
+def is_hybrid_audit() -> bool:
+    return AUDIT_MODE == "hybrid"
+
+
+# Agent vs customer cues for the first window of the call (no LLM).
+_AGENT_CUES = (
+    "thank you for calling",
+    "thanks for calling",
+    "thank you for contacting",
+    "how can i help",
+    "how may i help",
+    "how can i assist",
+    "how may i assist",
+    "my name is",
+    "calling from",
+    "speaking with",
+    "welcome to",
+    "on behalf of",
+    "let me pull up",
+    "i've pulled up",
+    "for your security",
+    "verify your",
+    "i can look into",
+    "i can help you with",
+)
+_CUSTOMER_CUES = (
+    "i'm calling",
+    "i am calling",
+    "i was calling",
+    "calling about",
+    "my account",
+    "my order",
+    "my bill",
+    "can you help me",
+    "i need help",
+    "i've been trying",
+    "this is the third",
+    "i want to cancel",
+    "i need to speak",
+    "you guys",
+    "your company",
+)
+
+
+def _cue_score(text: str) -> int:
+    t = (text or "").lower()
+    score = 0
+    for cue in _AGENT_CUES:
+        if cue in t:
+            score += 2
+    for cue in _CUSTOMER_CUES:
+        if cue in t:
+            score -= 2
+    return score
+
+
+def _channel_int(value):
+    if value is None or value == "":
+        return None
     try:
-        agent = parse_json(call_claude(prompt)).get("agent_speaker")
-        if agent in speakers:
-            log.info("role classification: agent = %s", agent)
-            return agent
-        log.warning("role classification returned invalid speaker '%s'; falling back", agent)
-    except Exception as e:  # noqa: BLE001
-        log.error("role classification failed: %s; falling back to first speaker", e)
-    return identify_agent(segments)
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def classify_roles(segments):
+    """Identify the AGENT without Claude.
+
+    Prefer greeting/company cues in the opening turns. If those tie, use Hear
+    channel (lower channel index = agent, typical left/agent dual-channel).
+    Last resort: first speaker.
+    """
+    if not segments:
+        return None
+    speakers = []
+    for s in segments:
+        sp = s.get("speaker")
+        if sp and sp not in speakers:
+            speakers.append(sp)
+    if len(speakers) < 2:
+        agent = speakers[0] if speakers else identify_agent(segments)
+        applog.event(log, "role_classified", method="single_speaker", agent=agent)
+        log.info("role classification: agent = %s (single speaker)", agent)
+        return agent
+
+    window = [s for s in segments[:15] if s.get("speaker")]
+    scores = {sp: 0 for sp in speakers}
+    channel_of = {sp: [] for sp in speakers}
+    for s in window:
+        sp = s["speaker"]
+        scores[sp] = scores.get(sp, 0) + _cue_score(s.get("text") or "")
+        ch = _channel_int(s.get("channel"))
+        if ch is not None:
+            channel_of.setdefault(sp, []).append(ch)
+
+    best = max(speakers, key=lambda sp: scores.get(sp, 0))
+    worst = min(speakers, key=lambda sp: scores.get(sp, 0))
+    if scores[best] > scores[worst]:
+        applog.event(
+            log, "role_classified",
+            method="greeting", agent=best, score=scores[best],
+        )
+        log.info("role classification: agent = %s (greeting cues)", best)
+        return best
+
+    # Distinct channels: speaker whose median/mode channel is the lower index.
+    mode_ch = {}
+    for sp, chans in channel_of.items():
+        if not chans:
+            continue
+        mode_ch[sp] = max(set(chans), key=chans.count)
+    if len(mode_ch) >= 2 and len(set(mode_ch.values())) >= 2:
+        agent = min(mode_ch, key=lambda sp: mode_ch[sp])
+        applog.event(
+            log, "role_classified",
+            method="channel", agent=agent, channel=mode_ch[agent],
+        )
+        log.info(
+            "role classification: agent = %s (channel %s)",
+            agent, mode_ch[agent],
+        )
+        return agent
+
+    agent = identify_agent(segments)
+    applog.event(log, "role_classified", method="first_speaker", agent=agent)
+    log.info("role classification: agent = %s (first speaker fallback)", agent)
+    return agent
 
 
 def format_transcript(segments, agent_speaker):
@@ -208,6 +324,19 @@ def build_prompt(question, transcript_text, allowed_verdicts, strict=False):
     return base
 
 
+def _claude_json_body(prompt: str) -> dict:
+    """Sonnet 5+ accepts output_config.effort. Haiku 4.5 rejects it."""
+    body = {
+        "model": MODEL,
+        "max_tokens": MAX_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if "haiku" not in (MODEL or "").lower():
+        body["thinking"] = {"type": "disabled"}
+        body["output_config"] = {"effort": CLAUDE_EFFORT}
+    return body
+
+
 def call_claude(prompt):
     """POST to Claude with temperature=0. Retries with backoff on 429/5xx.
     Logs every failed attempt. Raises RuntimeError only if all attempts fail."""
@@ -226,10 +355,7 @@ def call_claude(prompt):
                 headers={"x-api-key": ANTHROPIC_API_KEY,
                          "anthropic-version": "2023-06-01",
                          "content-type": "application/json"},
-                json={"model": MODEL, "max_tokens": MAX_TOKENS,
-                      "thinking": {"type": "disabled"},
-                      "output_config": {"effort": "low"},
-                      "messages": [{"role": "user", "content": prompt}]},
+                json=_claude_json_body(prompt),
                 timeout=60,
             )
             if resp.status_code == 200:
@@ -448,8 +574,10 @@ def draft_retention_email(transcript_text, segments):
 def run_parallel_claude_wave(criteria, segments, agent_speaker, transcript_text, max_workers=None, rubric=None):
     """
     Fire independent Claude work in one parallel wave (dimensions/criteria +
-    churn + feedback). Retention email and coaching tips are on-demand.
+    churn). Retention email, coaching tips, and customer feedback are on-demand.
+    Hybrid mode: Claude for resolution + churn (parallel); skip tone/ownership step-2.
     """
+    mode = audit_mode()
     if rubric is not None and qa_v8.is_v8_rubric(rubric):
         ordered, churn, feedback, retention_email, score, tally, grade, hostile, manager_review = (
             qa_v8.run_v8_wave(
@@ -457,10 +585,12 @@ def run_parallel_claude_wave(criteria, segments, agent_speaker, transcript_text,
                 call_claude, parse_json, build_prompt, validate_evidence,
                 assess_churn, extract_feedback,
                 max_workers=max_workers,
+                audit_mode=mode,
             )
         )
         return {
             "mode": "v8",
+            "audit_mode": mode,
             "results": ordered,
             "churn": churn,
             "feedback": feedback,
@@ -474,10 +604,9 @@ def run_parallel_claude_wave(criteria, segments, agent_speaker, transcript_text,
         }
 
     n = len(criteria)
-    workers = max_workers or min(32, max(4, n + 2))
+    workers = max_workers or min(32, max(4, n + 1))
     ordered = [None] * n
     churn = None
-    feedback = None
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futs = {}
@@ -486,25 +615,27 @@ def run_parallel_claude_wave(criteria, segments, agent_speaker, transcript_text,
                 evaluate_criterion, cr, segments, agent_speaker, transcript_text
             )] = ("crit", i, cr)
         futs[pool.submit(assess_churn, transcript_text, segments)] = ("churn", None, None)
-        futs[pool.submit(extract_feedback, transcript_text, segments)] = ("feedback", None, None)
         for fut in as_completed(futs):
             kind, i, cr = futs[fut]
             if kind == "crit":
                 ordered[i] = (cr, fut.result())
-            elif kind == "churn":
-                churn = fut.result()
             else:
-                feedback = fut.result()
+                churn = fut.result()
     log.info(
         "parallel Claude wave done in %.1fs "
-        "(%d criteria + churn + feedback, workers=%d)",
+        "(%d criteria + churn, workers=%d)",
         time.perf_counter() - t0, n, workers,
     )
     return {
         "mode": "v3",
         "results": ordered,
         "churn": churn,
-        "feedback": feedback,
+        "feedback": {
+            "status": "skipped",
+            "reason": "on_demand",
+            "agent": [],
+            "product": [],
+        },
         "retention_email": None,
     }
 

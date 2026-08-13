@@ -1,10 +1,12 @@
 import { useState, useEffect, useRef, Fragment } from "react";
+import JSZip from "jszip";
+import { getHearFfmpeg, transcodeHearCopy } from "./hearTranscode";
 import "./App.css";
 
 const API = "http://localhost:8000";
 const MAX_UPLOAD_MB = 25;
 const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
-const MAX_BULK_FILES = 5;
+const MAX_BULK_FILES = 20;
 const FRACTION = { pass: 1, partial: 0.5, fail: 0, unverified: 0, error: 0 };
 
 function fmtTime(s) {
@@ -65,8 +67,22 @@ function callLabel(c) {
 
 function methodLabel(method) {
   if (!method) return "scored";
+  if (method === "deterministic_hybrid") return "Hybrid rules";
   if (method === "llm" || String(method).includes("llm")) return "AI judgment";
   return "Rule check";
+}
+
+/** Uncompressed zip so the server can extract and run Hear + Claude in parallel. */
+async function zipAudioFiles(files) {
+  if (!files || files.length < 2) {
+    throw new Error("Zip is only used when importing more than one file.");
+  }
+  const zip = new JSZip();
+  files.forEach((f, i) => {
+    const name = String(f.name || `file-${i + 1}.mp3`).replace(/[/\\]/g, "_");
+    zip.file(`${String(i).padStart(2, "0")}_${name}`, f);
+  });
+  return zip.generateAsync({ type: "blob", compression: "STORE" });
 }
 
 /** Client-side progress + elapsed timer (no server progress stream). */
@@ -112,7 +128,7 @@ function JobProgress({ active, phase, fromUpload }) {
   const hint =
     phase === "transcribe"
       ? "Usually 20–40 seconds."
-      : "Rubric, churn, feedback, and draft email run together.";
+      : "Roles from the recording channels; scoring follows AUDIT_MODE (hybrid: resolution + churn).";
 
   return (
     <div className="job-progress" aria-live="polite">
@@ -159,6 +175,8 @@ export default function App() {
   const [emailMessage, setEmailMessage] = useState(null);
   const [coachingLoading, setCoachingLoading] = useState(false);
   const [coachingError, setCoachingError] = useState(null);
+  const [feedbackLoading, setFeedbackLoading] = useState(false);
+  const [feedbackError, setFeedbackError] = useState(null);
   const [showLibrary, setShowLibrary] = useState(false);
   const [manualReviewFlagged, setManualReviewFlagged] = useState(false);
   const [manualReviewMessage, setManualReviewMessage] = useState(null);
@@ -191,6 +209,8 @@ export default function App() {
     setEmailMessage(null);
     setCoachingError(null);
     setCoachingLoading(false);
+    setFeedbackError(null);
+    setFeedbackLoading(false);
     setManualReviewFlagged(false);
     setManualReviewMessage(null);
     setAudit(null);
@@ -250,6 +270,43 @@ export default function App() {
     return r.json();
   }
 
+  function applyCompletedAudit(id, auditJson) {
+    setCallId(id);
+    setAudit(auditJson);
+    if (
+      auditJson.flagged ||
+      (auditJson.manager_review && auditJson.manager_review.length)
+    ) {
+      setManualReviewFlagged(true);
+      const reasons = formatReviewReasons(auditJson.manager_review);
+      setManualReviewMessage(
+        reasons
+          ? `Auto-flagged for manager review: ${reasons}.`
+          : `Call #${id} flagged for manual review.`,
+      );
+    } else {
+      setManualReviewFlagged(false);
+      setManualReviewMessage(null);
+    }
+  }
+
+  async function uploadBatchZip(files) {
+    if (!files || files.length < 2) {
+      throw new Error("Zip is only used when importing more than one file.");
+    }
+    const blob = await zipAudioFiles(files);
+    const fd = new FormData();
+    fd.append("file", blob, "batch.zip");
+    const r = await fetch(`${API}/api/upload-batch`, { method: "POST", body: fd });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      const detail = typeof d.detail === "string" ? d.detail : "Batch upload failed";
+      throw new Error(detail);
+    }
+    const data = await r.json();
+    return data.calls || [];
+  }
+
   async function handleFiles(fileList) {
     const all = Array.from(fileList || []).filter(Boolean);
     if (!all.length || bulkRunning || uploading) return;
@@ -281,9 +338,15 @@ export default function App() {
         file: f,
       };
     });
-    setBulkJobs(jobs.map(({ file, ...rest }) => rest));
-
     const work = jobs.filter((j) => j.status !== "failed");
+    const viaZip = work.length > 1;
+    setBulkJobs(
+      jobs.map(({ file, ...rest }) => ({
+        ...rest,
+        viaZip: viaZip && rest.status !== "failed",
+      })),
+    );
+
     if (!work.length) {
       setUploadError("No files within the 25 MB limit to import.");
       return;
@@ -298,15 +361,16 @@ export default function App() {
     let lastAudit = null;
 
     try {
-      for (const job of work) {
+      if (!viaZip) {
+        // One file: no zip. POST /api/upload transcodes a Hear copy and
+        // keeps the original bytes for playback.
+        const job = work[0];
         patchBulkJob(job.key, { status: "uploading", error: null });
-        setUploading(true);
         try {
           const call_id = await uploadOneFile(job.file);
           patchBulkJob(job.key, { status: "auditing", callId: call_id });
           setUploading(false);
           setLoading(true);
-
           const auditJson = await fetchAuditJson(call_id);
           patchBulkJob(job.key, {
             status: "done",
@@ -323,30 +387,86 @@ export default function App() {
         } finally {
           setLoading(false);
         }
+      } else {
+        work.forEach((job) =>
+          patchBulkJob(job.key, { status: "transcoding", error: null }),
+        );
+        try {
+          setLoading(true);
+          await getHearFfmpeg();
+          const ready = [];
+          for (let i = 0; i < work.length; i++) {
+            const job = work[i];
+            patchBulkJob(job.key, { status: "transcoding", error: null });
+            try {
+              const wav = await transcodeHearCopy(job.file, i);
+              ready.push({ job, file: wav });
+              patchBulkJob(job.key, { status: "uploading" });
+            } catch (e) {
+              patchBulkJob(job.key, {
+                status: "failed",
+                error: e.message || "Hear transcode failed",
+              });
+            }
+          }
+          if (ready.length === 1) {
+              const { job, file } = ready[0];
+              const call_id = await uploadOneFile(file);
+              patchBulkJob(job.key, { status: "auditing", callId: call_id });
+              const auditJson = await fetchAuditJson(call_id);
+              patchBulkJob(job.key, {
+                status: "done",
+                callId: call_id,
+                score: auditJson.score,
+              });
+              lastOkId = call_id;
+              lastAudit = auditJson;
+            } else if (ready.length >= 2) {
+            ready.forEach(({ job }) =>
+              patchBulkJob(job.key, { status: "auditing" }),
+            );
+            const rows = await uploadBatchZip(ready.map((r) => r.file));
+            ready.forEach((item, i) => {
+              const row = rows[i];
+              if (!row || row.status === "error" || row.call_id == null) {
+                patchBulkJob(item.job.key, {
+                  status: "failed",
+                  error: (row && row.error) || "Import failed",
+                  callId: row && row.call_id != null ? row.call_id : null,
+                });
+                return;
+              }
+              patchBulkJob(item.job.key, {
+                status: "done",
+                callId: row.call_id,
+                score: row.score,
+                error: null,
+              });
+              lastOkId = row.call_id;
+            });
+          }
+        } catch (e) {
+          const msg = e.message || "Import failed";
+          setUploadError(msg);
+          work.forEach((job) =>
+            patchBulkJob(job.key, { status: "failed", error: msg }),
+          );
+        } finally {
+          setLoading(false);
+        }
       }
 
       await refreshCalls();
       if (lastOkId != null) {
-        // Show the last completed audit; dropdown can switch to any other.
-        setCallId(lastOkId);
-        if (lastAudit) {
-          setAudit(lastAudit);
-          if (
-            lastAudit.flagged ||
-            (lastAudit.manager_review && lastAudit.manager_review.length)
-          ) {
-            setManualReviewFlagged(true);
-            const reasons = formatReviewReasons(lastAudit.manager_review);
-            setManualReviewMessage(
-              reasons
-                ? `Auto-flagged for manager review: ${reasons}.`
-                : `Call #${lastOkId} flagged for manual review.`,
-            );
-          } else {
-            setManualReviewFlagged(false);
-            setManualReviewMessage(null);
+        if (!lastAudit) {
+          try {
+            lastAudit = await fetchAuditJson(lastOkId);
+          } catch {
+            lastAudit = null;
           }
         }
+        if (lastAudit) applyCompletedAudit(lastOkId, lastAudit);
+        else setCallId(lastOkId);
       }
     } finally {
       setUploading(false);
@@ -380,6 +500,32 @@ export default function App() {
       setCoachingError(e.message || "Could not generate coaching.");
     } finally {
       setCoachingLoading(false);
+    }
+  }
+
+  async function loadFeedback() {
+    if (callId == null || feedbackLoading) return;
+    if ((audit?.feedback || {}).status === "ok") return;
+    const id = callId;
+    setFeedbackLoading(true);
+    setFeedbackError(null);
+    try {
+      const r = await fetch(`${API}/api/calls/${id}/feedback`, { method: "POST" });
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        const detail = typeof d.detail === "string" ? d.detail : "Could not load feedback.";
+        throw new Error(detail);
+      }
+      const data = await r.json();
+      setAudit((prev) =>
+        prev && prev.call_id === id
+          ? { ...prev, feedback: data.feedback || prev.feedback }
+          : prev,
+      );
+    } catch (e) {
+      setFeedbackError(e.message || "Could not load feedback.");
+    } finally {
+      setFeedbackLoading(false);
     }
   }
 
@@ -447,7 +593,9 @@ export default function App() {
   const churnSeg = churn?.evidence_seq != null ? segBySeq[churn.evidence_seq] : null;
 
   const feedback = audit?.feedback ?? null;
-  const feedbackStatus = feedback?.status ?? "ok";
+  const feedbackStatus = feedback?.status ?? "skipped";
+  const feedbackReady = feedbackStatus === "ok";
+  const showFeedbackButton = !feedbackReady;
   const agentFeedback = feedback?.agent ?? [];
   const productFeedback = feedback?.product ?? [];
 
@@ -472,6 +620,7 @@ export default function App() {
 
   const bulkDoneCount = bulkJobs.filter((j) => j.status === "done").length;
   const bulkFailedCount = bulkJobs.filter((j) => j.status === "failed").length;
+  const viaZipImport = bulkJobs.some((j) => j.viaZip);
   const scoreByCallId = Object.fromEntries(
     bulkJobs.filter((j) => j.callId != null && j.score != null).map((j) => [j.callId, j.score]),
   );
@@ -513,6 +662,7 @@ export default function App() {
               {fmtTime(audit.audio_seconds)}
               {" · agent "}
               {audit.agent_speaker}
+              {audit.audit_mode ? ` · ${audit.audit_mode} audit` : ""}
             </div>
 
             <section className={`churn churn-${churnRisk}`}>
@@ -554,7 +704,11 @@ export default function App() {
               {churnRisk === "none" ? (
                 <div className="churn-reason">No churn risk detected in this call.</div>
               ) : churnRisk === "unknown" ? (
-                <div className="churn-reason">Churn risk could not be assessed for this call.</div>
+                <div className="churn-reason">
+                  {churn?.status === "skipped"
+                    ? "Churn LLM skipped in hybrid audit mode."
+                    : "Churn risk could not be assessed for this call."}
+                </div>
               ) : (
                 <>
                   <div className="churn-reason">{churn.reasoning}</div>
@@ -645,7 +799,10 @@ export default function App() {
                     </span>
                   </div>
                   <div className="finding-tag">{methodLabel(f.method)}</div>
-                  <p className="finding-reason">{f.reasoning}</p>
+                  <p className="finding-why">
+                    <span className="finding-why-label">Why this score</span>
+                    {f.why || f.reasoning}
+                  </p>
                   {f.evidence_text && (
                     <div className="evidence">
                       <span className="quote">“{f.evidence_text}”</span>
@@ -660,6 +817,31 @@ export default function App() {
                         </button>
                       )}
                     </div>
+                  )}
+                  {Array.isArray(f.subchecks) && f.subchecks.length > 0 && (
+                    <ul className="subchecks">
+                      {f.subchecks.map((c) => {
+                        const cseg = c.evidence_seq != null ? segBySeq[c.evidence_seq] : null;
+                        const jumpAt = c.jump_at != null ? c.jump_at : cseg?.start;
+                        return (
+                          <li className="subcheck" key={c.id}>
+                            <span className={`badge v-${c.verdict}`}>{c.verdict}</span>
+                            <span className="subcheck-body">
+                              <span className="subcheck-name">{c.name}</span>
+                              <span className="subcheck-reason">{c.reasoning}</span>
+                              {c.evidence_text && (
+                                <span className="subcheck-quote">“{c.evidence_text}”</span>
+                              )}
+                              {jumpAt != null && (
+                                <button className="jump" onClick={() => jumpTo(jumpAt)}>
+                                  {fmtTime(jumpAt)}
+                                </button>
+                              )}
+                            </span>
+                          </li>
+                        );
+                      })}
+                    </ul>
                   )}
                 </div>
               );
@@ -697,15 +879,32 @@ export default function App() {
               )}
             </section>
 
-            {audit.feedback && (
-              <section className="customer-feedback">
+            <section className="customer-feedback">
+              <div className="feedback-head">
                 <h2 className="h">Feedback</h2>
-
-                {feedbackStatus === "error" ? (
-                  <div className="banner error">
-                    Customer feedback could not be assessed for this call.
-                  </div>
-                ) : (
+                {showFeedbackButton && (
+                  <button
+                    type="button"
+                    className="coach-btn"
+                    onClick={loadFeedback}
+                    disabled={feedbackLoading}
+                  >
+                    {feedbackLoading ? "Getting…" : "Get feedback"}
+                  </button>
+                )}
+              </div>
+              {feedbackError && <div className="banner error">{feedbackError}</div>}
+              {feedbackStatus === "error" ? (
+                <div className="banner error">
+                  Customer feedback could not be assessed for this call.
+                </div>
+              ) : !feedbackReady ? (
+                <p className="coach-empty">
+                  {feedbackLoading
+                    ? "Reading the transcript for customer feedback…"
+                    : "Optional — runs one Claude call when you ask."}
+                </p>
+              ) : (
                   <div className="fb-grid">
                     <div className="fb-group">
                       <h3 className="fb-group-title">Feedback for agent</h3>
@@ -767,9 +966,8 @@ export default function App() {
                       )}
                     </div>
                   </div>
-                )}
-              </section>
-            )}
+              )}
+            </section>
 
           </section>
 
@@ -999,7 +1197,7 @@ export default function App() {
           <>
             <span className="dropzone-title">Drop call recordings</span>
             <span className="dropzone-sub">
-              Up to {MAX_BULK_FILES} files · {MAX_UPLOAD_MB} MB each · or click to browse
+              Up to {MAX_BULK_FILES} files · {MAX_UPLOAD_MB} MB each · one file keeps the original for playback; two or more transcode to 8 kHz Hear copies, then zip
             </span>
           </>
         )}
@@ -1027,8 +1225,11 @@ export default function App() {
                   </span>
                   <span className="bulk-job-status">
                     {j.status === "queued" && "Queued"}
-                    {j.status === "uploading" && "Uploading / transcribing…"}
-                    {j.status === "auditing" && "Auditing…"}
+                    {j.status === "transcoding" && "Transcoding Hear copy…"}
+                    {j.status === "uploading" &&
+                      (j.viaZip ? "Zipping Hear copies…" : "Uploading / transcribing…")}
+                    {j.status === "auditing" &&
+                      (j.viaZip ? "Transcribe + QA in parallel…" : "Auditing…")}
                     {j.status === "done" && (
                       <>
                         Done
@@ -1057,7 +1258,9 @@ export default function App() {
             ))}
           </ul>
           <p className="bulk-progress-hint">
-            Switch calls from the dropdown above.
+            {viaZipImport
+              ? "The browser transcodes each file to an 8 kHz stereo Hear copy, zips those copies, then PyAI and Claude run in parallel. Bulk playback is the Hear copy."
+              : "This file is transcribed with a Hear copy; the original is kept for playback."}
           </p>
         </section>
       )}

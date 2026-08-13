@@ -1,0 +1,16 @@
+---
+description: After every change request, tail CallProof backend logs
+alwaysApply: true
+---
+
+# Tail backend logs after changes
+
+When Sushil asks you to **make a change** (code, config, env default, restart, fix), after the change is applied:
+
+1. From the repo root, run `tail -f logs/callproof.log` in the **background** (`block_until_ms: 0`).
+2. If a `tail -f logs/callproof.log` session is already running, do **not** start another.
+3. In the chat reply, also quote the new/relevant `event=` lines from that file.
+
+Do **not** run `tail -f` for questions-only prompts (explain, how does X work).
+
+Working directory: repo root (`callproof-2testing-ui`). Never tail `.env` or print secrets.

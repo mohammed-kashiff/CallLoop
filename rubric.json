@@ -66,7 +66,7 @@
           {
             "step": 1,
             "method": "deterministic",
-            "logic": "Check specific-ownership terms first. If matched -> pass, done, no LLM call. If no specific match, check vague-ownership terms -- if matched, proceed to step 2. If neither list matches at all -> fail, done, no LLM call.",
+            "logic": "Check personal-commitment phrases and next-step patterns anywhere in the agent's turns, including adjacent turns joined to catch ASR splits (I'll get back to you, I'll let you know, we'll make sure, I'm on the case, ticket/case numbers, named team / our engineers). If matched -> pass. If no specific match, check vague-ownership terms in the last 8 agent turns -- if matched, proceed to step 2. If neither list matches at all -> fail.",
             "coaching_output": {
               "pass_specific_match": "none -- self-evident, no note needed",
               "fail_no_match": "Deterministic template: 'No ownership of next steps was stated before the call ended -- always name who owns the follow-up.'"
@@ -96,12 +96,14 @@
         "name": "Active Listening",
         "method": "deterministic",
         "weight": 20,
+        "logic": "Two checks. Interruptions: overlap of 1.5s+ during the first 5 customer turns (0=pass, 1=partial, 2+=fail; short backchannels ignored). Dead air: gap of 20s+ between turns (none=pass; hold warning + Resolution pass=pass; hold warning without Resolution=partial; any unwarned=fail). Overall verdict is the worse of the two.",
         "coaching_output": {
           "source": "deterministic_template",
           "fires_on": ["partial", "fail"],
           "templates": {
             "partial": "One interruption detected at {timestamp} while the customer was describing their issue -- let them finish before responding.",
-            "fail": "{count} interruptions detected during the customer's opening turns (first at {timestamp}) -- give the customer the full problem statement before jumping in."
+            "fail": "{count} interruptions detected during the customer's opening turns (first at {timestamp}) -- give the customer the full problem statement before jumping in.",
+            "dead_air_fail": "Unexplained silence of {gap}s at {timestamp} -- tell the customer you need a moment before you go quiet."
           }
         }
       },
@@ -114,6 +116,7 @@
           {
             "step": 1,
             "method": "deterministic",
+            "logic": "Six phrase banks on agent turns: profanity and hostile phrases fail the dimension (manager review + score cap). Greetings (first 3 agent turns), empathy, professionalism, and willingness-to-help are positive checks. Willingness also passes if the customer confirms it helped, or if Resolution passed. Hybrid: 2+ positives and no hostility = pass; 1 positive = partial; 0 positives = fail. Full: hostility still fails; otherwise Claude judges warmth.",
             "on_match": "Force verdict='fail', trigger manager_review_policy.triggers.hostile_language_override AND cap_overall_score_at_60.",
             "coaching_output": {"source": "none", "note": "Routes to manager review instead of a coaching_note."}
           },

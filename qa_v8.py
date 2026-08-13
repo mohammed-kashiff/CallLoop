@@ -131,7 +131,8 @@ def evaluate_resolution(dim, segments, agent, transcript_text, call_claude, pars
     )
 
 
-def evaluate_ownership(dim, segments, agent, transcript_text, call_claude, parse_json):
+def evaluate_ownership(dim, segments, agent, transcript_text, call_claude, parse_json,
+                       llm_enabled=True):
     step1 = rv8.check_ownership_step1(segments, agent)
     if not step1.get("needs_llm"):
         return {
@@ -142,6 +143,26 @@ def evaluate_ownership(dim, segments, agent, transcript_text, call_claude, parse
             "evidence_verified": step1.get("evidence_text") is not None,
             "coaching_note": step1.get("coaching_note"),
             "hostile_override": False,
+            "method_used": "deterministic",
+        }
+
+    if not llm_enabled:
+        term = (step1.get("llm_context") or {}).get("matched_term", "")
+        combined = rv8.combine_ownership_result(step1, "dismissive", transcript_text)
+        combined["reasoning"] = (
+            f"Partial because the closing used vague language ('{term}') instead of a personal "
+            f"commitment. Hybrid rules do not ask Claude whether that was honest or dismissive, "
+            f"so vague language scores half credit (10 of 20)."
+        )
+        return {
+            "verdict": combined["verdict"],
+            "reasoning": combined["reasoning"],
+            "evidence_text": combined.get("evidence_text"),
+            "evidence_seq": combined.get("evidence_seq"),
+            "evidence_verified": combined.get("evidence_text") is not None,
+            "coaching_note": combined.get("coaching_note"),
+            "hostile_override": False,
+            "method_used": "deterministic_hybrid",
         }
 
     term = (step1.get("llm_context") or {}).get("matched_term", "")
@@ -176,11 +197,14 @@ def evaluate_ownership(dim, segments, agent, transcript_text, call_claude, parse
         "evidence_verified": combined.get("evidence_text") is not None,
         "coaching_note": combined.get("coaching_note"),
         "hostile_override": False,
+        "method_used": "deterministic_plus_llm",
     }
 
 
-def evaluate_listening(dim, segments, agent, transcript_text):
-    r = rv8.has_active_listening(segments, agent)
+def evaluate_listening(dim, segments, agent, transcript_text, resolution_passed=False):
+    r = rv8.score_listening_categories(
+        segments, agent, resolution_passed=resolution_passed,
+    )
     return {
         "verdict": r["verdict"],
         "reasoning": r["reasoning"],
@@ -189,21 +213,43 @@ def evaluate_listening(dim, segments, agent, transcript_text):
         "evidence_verified": r.get("evidence_text") is not None,
         "coaching_note": r.get("coaching_note"),
         "hostile_override": False,
+        "method_used": "deterministic",
+        "checks": r.get("checks") or [],
     }
 
 
 def evaluate_tone(dim, segments, agent, transcript_text, call_claude, parse_json,
-                  build_prompt, validate_evidence):
-    step1 = rv8.check_hostile_step1(segments, agent)
-    if not step1.get("needs_llm"):
+                  build_prompt, validate_evidence, llm_enabled=True,
+                  resolution_passed=False):
+    scored = rv8.score_tone_categories(
+        segments, agent, resolution_passed=resolution_passed,
+    )
+    checks = scored.get("checks") or []
+
+    if scored.get("hostile_override"):
         return {
             "verdict": "fail",
-            "reasoning": step1["reasoning"],
-            "evidence_text": step1.get("evidence_text"),
-            "evidence_seq": step1.get("evidence_seq"),
-            "evidence_verified": True,
+            "reasoning": scored["reasoning"],
+            "evidence_text": scored.get("evidence_text"),
+            "evidence_seq": scored.get("evidence_seq"),
+            "evidence_verified": scored.get("evidence_text") is not None,
             "coaching_note": None,
             "hostile_override": True,
+            "method_used": "deterministic",
+            "checks": checks,
+        }
+
+    if not llm_enabled:
+        return {
+            "verdict": scored["verdict"],
+            "reasoning": scored["reasoning"],
+            "evidence_text": scored.get("evidence_text"),
+            "evidence_seq": scored.get("evidence_seq"),
+            "evidence_verified": scored.get("evidence_text") is not None,
+            "coaching_note": None,
+            "hostile_override": False,
+            "method_used": "deterministic_hybrid",
+            "checks": checks,
         }
 
     extra = ""
@@ -215,7 +261,7 @@ def evaluate_tone(dim, segments, agent, transcript_text, call_claude, parse_json
         TONE_QUESTION, transcript_text, segments, extra,
     )
     combined = rv8.combine_tone_result(
-        step1,
+        {"needs_llm": True},
         llm_verdict=llm.get("verdict"),
         llm_reasoning=llm.get("reasoning"),
         llm_evidence_seq=llm.get("evidence_seq"),
@@ -232,20 +278,24 @@ def evaluate_tone(dim, segments, agent, transcript_text, call_claude, parse_json
         "coaching_note": combined.get("coaching_note"),
         "hostile_override": False,
         "confidence": llm.get("confidence"),
+        "method_used": "deterministic_override_plus_llm",
+        "checks": checks,
     }
 
 
 def evaluate_dimension(dim, segments, agent, transcript_text, call_claude, parse_json,
-                       build_prompt, validate_evidence):
+                       build_prompt, validate_evidence, llm_enabled=True):
     did = dim["id"]
     if did == "resolution_effectiveness":
         res = evaluate_resolution(
             dim, segments, agent, transcript_text, call_claude, parse_json,
             build_prompt, validate_evidence,
         )
+        res.setdefault("method_used", "llm")
     elif did == "ownership_next_steps":
         res = evaluate_ownership(
             dim, segments, agent, transcript_text, call_claude, parse_json,
+            llm_enabled=llm_enabled,
         )
     elif did == "active_listening":
         res = evaluate_listening(dim, segments, agent, transcript_text)
@@ -253,6 +303,7 @@ def evaluate_dimension(dim, segments, agent, transcript_text, call_claude, parse
         res = evaluate_tone(
             dim, segments, agent, transcript_text, call_claude, parse_json,
             build_prompt, validate_evidence,
+            llm_enabled=llm_enabled,
         )
     else:
         res = {
@@ -290,19 +341,23 @@ def score_v8(results):
 
 def run_v8_wave(rubric, segments, agent_speaker, transcript_text,
                 call_claude, parse_json, build_prompt, validate_evidence,
-                assess_churn, extract_feedback,
-                max_workers=None):
+                assess_churn, _extract_feedback=None,
+                max_workers=None, audit_mode="full"):
     dims = list_dimensions(rubric)
     n = len(dims)
-    workers = max_workers or min(16, max(4, n + 2))
+    hybrid = audit_mode == "hybrid"
+    llm_enabled = not hybrid
+    # hybrid: extra worker for dedicated churn LLM (parallel with resolution).
+    workers = max_workers or min(16, max(4, n + 1))
     ordered = [None] * n
-    churn = feedback = None
+    churn = None
     t0 = time.perf_counter()
 
     def _eval(dim):
         return evaluate_dimension(
             dim, segments, agent_speaker, transcript_text,
             call_claude, parse_json, build_prompt, validate_evidence,
+            llm_enabled=llm_enabled,
         )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -310,15 +365,64 @@ def run_v8_wave(rubric, segments, agent_speaker, transcript_text,
         for i, dim in enumerate(dims):
             futs[pool.submit(_eval, dim)] = ("dim", i, dim)
         futs[pool.submit(assess_churn, transcript_text, segments)] = ("churn", None, None)
-        futs[pool.submit(extract_feedback, transcript_text, segments)] = ("feedback", None, None)
         for fut in as_completed(futs):
             kind, i, dim = futs[fut]
             if kind == "dim":
                 ordered[i] = (dim, fut.result())
-            elif kind == "churn":
-                churn = fut.result()
             else:
-                feedback = fut.result()
+                churn = fut.result()
+
+    # Agent/product feedback is on-demand (Get feedback button), not first load.
+    feedback = {
+        "status": "skipped",
+        "reason": "on_demand",
+        "agent": [],
+        "product": [],
+    }
+
+    resolution_passed = False
+    for item in ordered:
+        if not item:
+            continue
+        dim, res = item
+        if dim.get("id") == "resolution_effectiveness" and res.get("verdict") == "pass":
+            resolution_passed = True
+            break
+
+    if resolution_passed:
+        for i, item in enumerate(ordered):
+            if not item:
+                continue
+            dim, res = item
+            did = dim.get("id")
+            if did == "active_listening":
+                new_res = evaluate_listening(
+                    dim, segments, agent_speaker, transcript_text,
+                    resolution_passed=True,
+                )
+                new_res["delivery_channel"] = rv8.coaching_delivery_channel(
+                    new_res.get("verdict")
+                )
+                ordered[i] = (dim, new_res)
+            elif did == "tone_empathy_professionalism" and not res.get("hostile_override"):
+                if hybrid:
+                    new_res = evaluate_tone(
+                        dim, segments, agent_speaker, transcript_text,
+                        call_claude, parse_json, build_prompt, validate_evidence,
+                        llm_enabled=False,
+                        resolution_passed=True,
+                    )
+                    new_res["delivery_channel"] = rv8.coaching_delivery_channel(
+                        new_res.get("verdict")
+                    )
+                    ordered[i] = (dim, new_res)
+                else:
+                    scored = rv8.score_tone_categories(
+                        segments, agent_speaker, resolution_passed=True,
+                    )
+                    patched = dict(res)
+                    patched["checks"] = scored.get("checks") or []
+                    ordered[i] = (dim, patched)
 
     score, tally, hostile = score_v8(ordered)
     grade = performance_band(score, rubric)
@@ -347,11 +451,31 @@ def run_v8_wave(rubric, segments, agent_speaker, transcript_text,
     )
 
     log.info(
-        "v8 wave done in %.1fs (%d dims) score=%s band=%s hostile=%s review=%s",
-        time.perf_counter() - t0, n, score, grade, hostile, len(manager_review),
+        "v8 wave done in %.1fs (%d dims) mode=%s score=%s band=%s hostile=%s review=%s",
+        time.perf_counter() - t0, n, audit_mode, score, grade, hostile, len(manager_review),
     )
-    # Retention email + dedicated coaching tips are on-demand (not in this wave).
+    # Retention email, coaching tips, and customer feedback are on-demand (not in this wave).
     return ordered, churn, feedback, None, score, tally, grade, hostile, manager_review
+
+
+def _why_this_score(dim, res) -> str:
+    """Plain-language explanation of verdict + points for the UI."""
+    weight = dim.get("weight") or rv8.WEIGHTS.get(dim["id"], 0)
+    v = res.get("verdict") or "error"
+    frac = rv8.VERDICT_POINTS.get(v)
+    name = dim.get("name") or dim["id"]
+    reason = (res.get("reasoning") or "").strip()
+    labels = {"pass": "Pass", "partial": "Partial", "fail": "Fail"}
+    if frac is None:
+        head = f"{name} was not scored ({v})."
+    else:
+        pts = round(weight * frac, 1)
+        head = f"{name}: {labels.get(v, v)} — {pts} of {weight} points."
+    if not reason:
+        return head
+    if reason.lower().startswith(("pass because", "partial because", "fail because")):
+        return f"{head} {reason}"
+    return f"{head} {reason}"
 
 
 def findings_from_v8(results):
@@ -365,12 +489,14 @@ def findings_from_v8(results):
         out.append({
             "id": dim["id"],
             "name": dim["name"],
-            "method": dim.get("method"),
+            "method": res.get("method_used") or dim.get("method"),
             "weight": weight,
             "is_gate": bool(res.get("hostile_override")),
             "verdict": v,
             "reasoning": res.get("reasoning", ""),
+            "why": _why_this_score(dim, res),
             "points": pts,
+            "subchecks": res.get("checks") or [],
             "evidence_text": res.get("evidence_text"),
             "evidence_seq": res.get("evidence_seq"),
             "evidence_verified": res.get("evidence_verified"),

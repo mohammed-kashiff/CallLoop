@@ -10,7 +10,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 if not ANTHROPIC_API_KEY:
     sys.exit("ERROR: ANTHROPIC_API_KEY not found. Did you add it to .env?")
 
-MODEL = "claude-sonnet-5"
+MODEL = "claude-haiku-4-5"
 
 resp = httpx.post(
     "https://api.anthropic.com/v1/messages",
