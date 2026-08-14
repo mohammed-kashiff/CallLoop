@@ -1,3 +1,4 @@
+import { Link } from 'react-router-dom'
 import { FeedbackCue } from '../components/LoopCues'
 import { SketchWallpaper } from '../components/SketchWallpaper'
 import { KpiCard } from '../components/KpiCard'
@@ -5,7 +6,7 @@ import { Workspace } from '../components/Workspace'
 import { useAudit } from '../context/AuditContext'
 
 export function Feedbacks() {
-  const { report, showReport, loadFeedback, feedbackLoading } = useAudit()
+  const { report, showReport } = useAudit()
   const ready = report.feedback.status === 'ok'
   const empty = ready && !report.feedback.aboutAgent.length && !report.feedback.aboutProduct.length
 
@@ -16,18 +17,6 @@ export function Feedbacks() {
           <p className="crumb">Loop / Voice of customer</p>
           <h1>Feedbacks</h1>
         </div>
-        {showReport && !ready && (
-          <button
-            type="button"
-            className="choose-btn"
-            disabled={feedbackLoading}
-            onClick={() => {
-              void loadFeedback()
-            }}
-          >
-            {feedbackLoading ? 'Reading transcript…' : 'Load areas of improvement'}
-          </button>
-        )}
       </header>
 
       {!showReport && (
@@ -44,12 +33,12 @@ export function Feedbacks() {
           <div className="kpi-strip">
             <KpiCard
               label="Service"
-              value={String(report.feedback.aboutAgent.length)}
+              value={ready ? String(report.feedback.aboutAgent.length) : '—'}
               hint="agent signals"
             />
             <KpiCard
               label="Product"
-              value={String(report.feedback.aboutProduct.length)}
+              value={ready ? String(report.feedback.aboutProduct.length) : '—'}
               hint="product signals"
             />
             <KpiCard label="Agent" value={report.agentName} hint={report.callId} />
@@ -57,13 +46,24 @@ export function Feedbacks() {
 
           {!ready && (
             <p className="panel-lede">
-              Optional — runs one Claude call when you ask for areas of improvement.
+              Load areas of improvement from{' '}
+              <Link to="/agents-pulse" className="inline-link">
+                Agent Pulse → Evaluation
+              </Link>{' '}
+              for this call. Switch calls there and load again without leaving Pulse.
             </p>
           )}
           {empty && <p className="panel-lede">None detected on this call.</p>}
 
           {ready && (
             <Workspace
+              noteScopeKey={
+                report.numericCallId != null
+                  ? `feedback-${report.numericCallId}`
+                  : report.callId
+                    ? `feedback-${report.callId}`
+                    : null
+              }
               tabs={[
                 {
                   id: 'service',

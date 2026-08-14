@@ -21,11 +21,17 @@ export function TranscriptPlayer({
   const [playing, setPlaying] = useState(false)
   const audioRef = useRef<HTMLAudioElement>(null)
   const listRef = useRef<HTMLUListElement>(null)
+  /** When false, never move the list for the active speaker. */
+  const followRef = useRef(true)
+  const ignoreScrollRef = useRef(false)
+  const activeIdRef = useRef<string | null>(null)
 
   const activeId = useMemo(() => {
     const hit = segments.find((s) => currentTime >= s.start && currentTime < s.end)
     return hit?.id ?? null
   }, [segments, currentTime])
+
+  activeIdRef.current = activeId
 
   useEffect(() => {
     const a = audioRef.current
@@ -46,14 +52,32 @@ export function TranscriptPlayer({
     }
     setCurrentTime(seekTo)
     setPlaying(true)
+    followRef.current = true
     onSeekHandled()
   }, [seekTo, onSeekHandled])
 
   useEffect(() => {
-    if (!activeId || !listRef.current) return
-    const el = listRef.current.querySelector(`[data-seg="${activeId}"]`)
-    el?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+    if (!activeId || !followRef.current) return
+    const list = listRef.current
+    if (!list) return
+    const el = list.querySelector(`[data-seg="${activeId}"]`) as HTMLElement | null
+    if (!el) return
+    ignoreScrollRef.current = true
+    const top = el.offsetTop - list.clientHeight / 2 + el.clientHeight / 2
+    list.scrollTop = Math.max(0, top)
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        ignoreScrollRef.current = false
+      })
+    })
   }, [activeId])
+
+  const onListScroll = () => {
+    // Any real user scroll while reading = stop chasing the active line.
+    if (!ignoreScrollRef.current) {
+      followRef.current = false
+    }
+  }
 
   const progress = durationSec > 0 ? (currentTime / durationSec) * 100 : 0
 
@@ -65,6 +89,7 @@ export function TranscriptPlayer({
     }
     setCurrentTime(seconds)
     setPlaying(true)
+    followRef.current = true
   }
 
   return (
@@ -114,7 +139,7 @@ export function TranscriptPlayer({
         </div>
       </div>
 
-      <ul className="transcript-list" ref={listRef}>
+      <ul className="transcript-list" ref={listRef} onScroll={onListScroll}>
         {segments.map((seg) => (
           <li
             key={seg.id}

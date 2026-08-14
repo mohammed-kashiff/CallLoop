@@ -55,6 +55,13 @@ export function ChurnRisk() {
       </div>
 
       <Workspace
+        noteScopeKey={
+          report.numericCallId != null
+            ? `churn-${report.numericCallId}`
+            : report.callId
+              ? `churn-${report.callId}`
+              : null
+        }
         tabs={[
           {
             id: 'scale',

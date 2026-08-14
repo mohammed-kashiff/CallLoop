@@ -80,6 +80,8 @@ export function AgentsPulse() {
     calls,
     selectCall,
     flagCurrent,
+    loadFeedback,
+    feedbackLoading,
     onSeek,
     onSeekHandled,
     exportScorecard,
@@ -88,10 +90,22 @@ export function AgentsPulse() {
 
   const [tab, setTab] = useState('evaluation')
   const [flagMsg, setFlagMsg] = useState<string | null>(null)
+  const [feedbackErr, setFeedbackErr] = useState<string | null>(null)
   const tips = report.criteria.filter((c) => c.coachingTip)
   const closeItems = report.summary.actionItems.length
     ? report.summary.actionItems
     : tips.map((c) => c.coachingTip).filter(Boolean) as string[]
+  const feedbackReady = report.feedback.status === 'ok'
+  const feedbackEmpty =
+    feedbackReady &&
+    !report.feedback.aboutAgent.length &&
+    !report.feedback.aboutProduct.length
+
+  useEffect(() => {
+    // New call selected — leave any open note tab from the previous call.
+    setTab('evaluation')
+    setFeedbackErr(null)
+  }, [report.numericCallId, report.callId])
 
   useEffect(() => {
     if (showReport) setTab('evaluation')
@@ -215,6 +229,11 @@ export function AgentsPulse() {
           <Workspace
             activeId={tab}
             onActiveId={setTab}
+            noteScopeKey={
+              report.numericCallId != null
+                ? String(report.numericCallId)
+                : report.callId || null
+            }
             tabs={[
               {
                 id: 'evaluation',
@@ -225,6 +244,70 @@ export function AgentsPulse() {
                       <ScoreOverview report={report} animate={scoreAnimate} />
                       <h2 className="panel-title">{report.summary.headline}</h2>
                       <p className="panel-lede">{report.summary.narrative}</p>
+
+                      <section
+                        className="improvement-block"
+                        aria-label="Areas of improvement"
+                      >
+                        <div className="improvement-head">
+                          <h3 className="panel-title">Areas of improvement</h3>
+                          {!feedbackReady && (
+                            <button
+                              type="button"
+                              className="choose-btn"
+                              disabled={running || feedbackLoading}
+                              onClick={() => {
+                                setFeedbackErr(null)
+                                void loadFeedback().catch((e: unknown) =>
+                                  setFeedbackErr(
+                                    e instanceof Error
+                                      ? e.message
+                                      : 'Could not load areas of improvement.',
+                                  ),
+                                )
+                              }}
+                            >
+                              {feedbackLoading
+                                ? 'Reading transcript…'
+                                : 'Load areas of improvement'}
+                            </button>
+                          )}
+                        </div>
+                        {!feedbackReady && (
+                          <p className="panel-lede">
+                            Optional — one Claude pass on this call’s transcript for
+                            service and product signals.
+                          </p>
+                        )}
+                        {feedbackErr && (
+                          <p className="upload-error" role="alert">
+                            {feedbackErr}
+                          </p>
+                        )}
+                        {feedbackEmpty && (
+                          <p className="panel-lede">None detected on this call.</p>
+                        )}
+                        {feedbackReady && !feedbackEmpty && (
+                          <div className="improvement-columns">
+                            <div>
+                              <h4 className="improvement-label">Service</h4>
+                              <ul className="feedback-list">
+                                {report.feedback.aboutAgent.map((item) => (
+                                  <li key={item}>{item}</li>
+                                ))}
+                              </ul>
+                            </div>
+                            <div>
+                              <h4 className="improvement-label">Product</h4>
+                              <ul className="feedback-list">
+                                {report.feedback.aboutProduct.map((item) => (
+                                  <li key={item}>{item}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          </div>
+                        )}
+                      </section>
                     </div>
                     <div className="eval-pane is-transcript">
                       <TranscriptPlayer

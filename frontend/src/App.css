@@ -1949,6 +1949,7 @@ html[data-color-mode='dark'] .empty-card.is-pulse > .sketch-wallpaper {
 }
 
 .transcript-list {
+  position: relative;
   max-height: 560px;
   overflow: auto;
 }

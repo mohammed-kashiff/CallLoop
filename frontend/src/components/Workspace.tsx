@@ -1,4 +1,11 @@
-import { useEffect, useId, useState, type KeyboardEvent, type ReactNode } from 'react'
+import {
+  useEffect,
+  useId,
+  useMemo,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+} from 'react'
 
 export interface WorkspaceTab {
   id: string
@@ -11,6 +18,8 @@ interface WorkspaceProps {
   activeId?: string
   onActiveId?: (id: string) => void
   allowNotes?: boolean
+  /** Isolates + Note tabs per call (or other entity). Required for per-call notes. */
+  noteScopeKey?: string | null
 }
 
 interface NoteTab {
@@ -19,20 +28,76 @@ interface NoteTab {
   body: string
 }
 
-export function Workspace({ tabs, activeId, onActiveId, allowNotes = true }: WorkspaceProps) {
+const NOTES_STORAGE_KEY = 'callproof.workspace-notes.v1'
+
+function readNotesStore(): Record<string, NoteTab[]> {
+  try {
+    const raw = localStorage.getItem(NOTES_STORAGE_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    return parsed as Record<string, NoteTab[]>
+  } catch {
+    return {}
+  }
+}
+
+function writeNotesStore(store: Record<string, NoteTab[]>) {
+  try {
+    localStorage.setItem(NOTES_STORAGE_KEY, JSON.stringify(store))
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
+export function Workspace({
+  tabs,
+  activeId,
+  onActiveId,
+  allowNotes = true,
+  noteScopeKey = null,
+}: WorkspaceProps) {
   const uid = useId()
+  const scope = (noteScopeKey && String(noteScopeKey).trim()) || 'global'
   const [internal, setInternal] = useState(tabs[0]?.id ?? '')
-  const [notes, setNotes] = useState<NoteTab[]>([])
+  const [notesStore, setNotesStore] = useState<Record<string, NoteTab[]>>(() => readNotesStore())
   const active = activeId ?? internal
+
+  const notes = useMemo(() => notesStore[scope] ?? [], [notesStore, scope])
+
+  const setScopeNotes = (updater: (list: NoteTab[]) => NoteTab[]) => {
+    setNotesStore((prev) => {
+      const nextList = updater(prev[scope] ?? [])
+      const next = { ...prev, [scope]: nextList }
+      if (nextList.length === 0) {
+        delete next[scope]
+      }
+      writeNotesStore(next)
+      return next
+    })
+  }
 
   const all = [
     ...tabs.map((t) => ({ ...t, closable: false as const })),
     ...notes.map((n) => ({ id: n.id, label: n.label, closable: true as const })),
   ]
 
+  const isNoteId = (id: string) => notes.some((n) => n.id === id) || /-note-\d+$/.test(id)
+
   useEffect(() => {
     if (!activeId && tabs[0] && !internal) setInternal(tabs[0].id)
   }, [tabs, activeId, internal])
+
+  // Call changed while a note tab was open → return to the first content tab.
+  useEffect(() => {
+    if (!isNoteId(active)) return
+    if (notes.some((n) => n.id === active)) return
+    const fallback = tabs[0]?.id ?? ''
+    if (!fallback) return
+    onActiveId?.(fallback)
+    if (activeId == null) setInternal(fallback)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only when scope/active mismatch
+  }, [scope])
 
   const setActive = (id: string) => {
     onActiveId?.(id)
@@ -41,13 +106,13 @@ export function Workspace({ tabs, activeId, onActiveId, allowNotes = true }: Wor
 
   const addNote = () => {
     const n = notes.length + 1
-    const id = `${uid}-note-${n}`
-    setNotes((list) => [...list, { id, label: `Note ${n}`, body: '' }])
+    const id = `call-${scope}-note-${n}`
+    setScopeNotes((list) => [...list, { id, label: `Note ${n}`, body: '' }])
     setActive(id)
   }
 
   const removeNote = (id: string) => {
-    setNotes((list) => list.filter((n) => n.id !== id))
+    setScopeNotes((list) => list.filter((n) => n.id !== id))
     if (active === id) setActive(tabs[0]?.id ?? '')
   }
 
@@ -115,10 +180,12 @@ export function Workspace({ tabs, activeId, onActiveId, allowNotes = true }: Wor
               className="note-field"
               value={note.body}
               maxLength={8000}
-              placeholder="Write a note…"
+              placeholder="Write a note for this call…"
               onChange={(e) => {
                 const body = e.target.value
-                setNotes((list) => list.map((n) => (n.id === note.id ? { ...n, body } : n)))
+                setScopeNotes((list) =>
+                  list.map((n) => (n.id === note.id ? { ...n, body } : n)),
+                )
               }}
             />
           </label>
