@@ -47,7 +47,7 @@ UI brand in this branch: **Call Loop v3** (React + TypeScript + Vite).
 4. **Audit** — `GET /api/calls/{id}/audit` runs hybrid/full QA (rules + Claude).
 5. **Report** — score, grade, findings, churn; on-demand feedback / email / flag for review.
 
-<img width="402" height="737" alt="image" src="https://github.com/user-attachments/assets/c1678a7e-f90a-4971-beb9-339aa0a1133a" /># CallProof (Call Loop)
+<img width="402" height="737" alt="image" src="https://github.com/user-attachments/assets/c1678a7e-f90a-4971-beb9-339aa0a1133a"
 
 ### Main pieces
 
