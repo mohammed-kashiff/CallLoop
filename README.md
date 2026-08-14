@@ -1,4 +1,3 @@
-<img width="402" height="737" alt="image" src="https://github.com/user-attachments/assets/c1678a7e-f90a-4971-beb9-339aa0a1133a" /># CallProof (Call Loop)
 
 CallProof scores support calls against a soft-skills rubric. Agents (or managers) upload recordings; the stack transcribes them with **PyAI Hear**, evaluates them with **Claude** (and hybrid rules), then shows a scorecard, churn signals, coaching-style feedback, and a review queue in the **Call Loop** UI.
 
@@ -48,49 +47,7 @@ UI brand in this branch: **Call Loop v3** (React + TypeScript + Vite).
 4. **Audit** — `GET /api/calls/{id}/audit` runs hybrid/full QA (rules + Claude).
 5. **Report** — score, grade, findings, churn; on-demand feedback / email / flag for review.
 
-## Call Scoring system:
-
-# Score math (v8)
-Verdict points: 
-pass = 1.0, partial = 0.5, fail = 0.0
-
-Dimension	Weight Method:
-
-**Resolution Effectiveness**
-40 | always LLM
-
-**Ownership & Next Steps**
-20 |  rules, then optional LLM
-
-**Active Listening**
-20 | rules only
-
-**Tone, Empathy & Professionalism**
-20 | rules, then optional LLM
-
-**Total**
-100 | Hostile language caps the overall score at 60.
-
-##Bands
-
-**Score	Label
-95–100**
-
-**Star Performer
-90–94**
-
-**Excelling
-80–89**
-
-**Solid Performer
-70–79**
-
-**Developing
-60–69**
-
-**Needs Improvement
-0–59
-Needs Immediate Attention**
+<img width="402" height="737" alt="image" src="https://github.com/user-attachments/assets/c1678a7e-f90a-4971-beb9-339aa0a1133a" /># CallProof (Call Loop)
 
 ### Main pieces
 
