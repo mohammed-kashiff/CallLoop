@@ -25,3 +25,16 @@ export function capWords(raw: string | null | undefined): string {
   return s.replace(/\b([a-z])/g, (ch) => ch.toUpperCase())
 }
 
+/**
+ * Discrete score colors:
+ * 90–100 green · 80–89 yellow · 70–79 light orange · 60–69 dark orange · <60 red
+ */
+export function scoreHue(score: number): string {
+  const s = Math.min(100, Math.max(0, Math.round(score)))
+  if (s >= 90) return '#16a34a' // green
+  if (s >= 80) return '#ca8a04' // yellow
+  if (s >= 70) return '#fb923c' // light orange
+  if (s >= 60) return '#ea580c' // dark orange
+  return '#dc2626' // red
+}
+

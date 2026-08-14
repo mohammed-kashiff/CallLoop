@@ -588,6 +588,11 @@
 }
 
 .call-progress.is-done .call-progress-value {
+  /* Default; score tint applied inline via scoreHue when available */
+  stroke: var(--teal);
+}
+
+.call-progress.is-completed .call-progress-value {
   stroke: var(--teal);
 }
 

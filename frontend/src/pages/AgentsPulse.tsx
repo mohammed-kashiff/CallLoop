@@ -10,7 +10,7 @@ import { TranscriptPlayer } from '../components/TranscriptPlayer'
 import { UploadZone } from '../components/UploadZone'
 import { Workspace, callNoteScopeKey } from '../components/Workspace'
 import { useAudit } from '../context/AuditContext'
-import { capFirst, capWords, formatTime } from '../lib/format'
+import { capFirst, capWords, formatTime, scoreHue } from '../lib/format'
 import type { BulkJob, CallListItem, JobStatus } from '../types'
 
 interface CallLaneRow {
@@ -383,11 +383,22 @@ export function AgentsPulse() {
                       status={String(row.status)}
                       startedAt={row.startedAt}
                       elapsedMs={row.elapsedMs}
+                      score={row.score}
                     />
                     <span className="call-lane-meta">
                       {row.duration != null ? formatTime(row.duration) : ''}
                     </span>
-                    <span className="call-lane-status">{statusLabel(row)}</span>
+                    <span
+                      className="call-lane-status"
+                      style={
+                        row.score != null &&
+                        (row.status === 'done' || row.status === 'completed')
+                          ? { color: scoreHue(row.score) }
+                          : undefined
+                      }
+                    >
+                      {statusLabel(row)}
+                    </span>
                   </button>
                 </li>
               )

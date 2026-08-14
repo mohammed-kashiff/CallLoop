@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { formatTime } from '../lib/format'
+import { formatTime, scoreHue } from '../lib/format'
 
 const ACTIVE = new Set(['transcoding', 'uploading', 'auditing'])
 
@@ -20,9 +20,11 @@ interface CallProgressProps {
   status: string
   startedAt?: number | null
   elapsedMs?: number | null
+  /** When done, tint the ring by score band. */
+  score?: number | null
 }
 
-export function CallProgress({ status, startedAt, elapsedMs }: CallProgressProps) {
+export function CallProgress({ status, startedAt, elapsedMs, score }: CallProgressProps) {
   const [now, setNow] = useState(() => Date.now())
   const active = ACTIVE.has(status)
 
@@ -44,9 +46,14 @@ export function CallProgress({ status, startedAt, elapsedMs }: CallProgressProps
   const offset = circumference * (1 - Math.min(100, Math.max(0, pct)) / 100)
   const showTime = active || elapsedMs != null || Boolean(startedAt)
   const label = status === 'done' ? 'Audit time' : 'Elapsed'
+  const scoreStroke =
+    (status === 'done' || status === 'completed') && score != null ? scoreHue(score) : undefined
 
   return (
-    <span className={['call-progress', `is-${status}`].join(' ')} title={`${label} ${formatTime(elapsedSec)}`}>
+    <span
+      className={['call-progress', `is-${status}`].join(' ')}
+      title={`${label} ${formatTime(elapsedSec)}`}
+    >
       <svg className="call-progress-ring" viewBox="0 0 40 40" aria-hidden="true">
         <circle className="call-progress-track" cx="20" cy="20" r={radius} />
         <circle
@@ -57,6 +64,7 @@ export function CallProgress({ status, startedAt, elapsedMs }: CallProgressProps
           style={{
             strokeDasharray: circumference,
             strokeDashoffset: offset,
+            ...(scoreStroke ? { stroke: scoreStroke } : null),
           }}
         />
       </svg>

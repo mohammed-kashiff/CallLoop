@@ -1677,7 +1677,6 @@ html[data-color-mode='dark'] .empty-card.is-pulse > .sketch-wallpaper {
 
 .score-ring-value {
   fill: none;
-  stroke: var(--teal);
   stroke-width: 8;
   stroke-linecap: round;
   transition: stroke-dashoffset 1s ease;

@@ -1,4 +1,4 @@
-import { capFirst, capWords } from '../lib/format'
+import { capFirst, capWords, scoreHue } from '../lib/format'
 import type { AuditReport } from '../types'
 
 interface ScoreOverviewProps {
@@ -8,8 +8,10 @@ interface ScoreOverviewProps {
 
 export function ScoreOverview({ report, animate }: ScoreOverviewProps) {
   const circumference = 2 * Math.PI * 54
-  const progress = Math.min(100, Math.max(0, report.overallScore)) / 100
+  const score = Math.min(100, Math.max(0, report.overallScore))
+  const progress = score / 100
   const offset = circumference * (1 - progress)
+  const color = scoreHue(score)
 
   return (
     <section className="score-overview" aria-label="Overall score">
@@ -21,6 +23,7 @@ export function ScoreOverview({ report, animate }: ScoreOverviewProps) {
             cx="60"
             cy="60"
             r="54"
+            stroke={color}
             style={{
               strokeDasharray: circumference,
               strokeDashoffset: animate ? offset : circumference,
@@ -28,7 +31,9 @@ export function ScoreOverview({ report, animate }: ScoreOverviewProps) {
           />
         </svg>
         <div className="score-ring-label">
-          <span className="score-number">{report.overallScore}</span>
+          <span className="score-number" style={{ color }}>
+            {report.overallScore}
+          </span>
           <span className="score-grade">/ 100</span>
         </div>
       </div>
