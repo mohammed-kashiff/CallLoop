@@ -45,8 +45,11 @@ AUDIO_SOURCE = "/Users/mohammed.kashif/Downloads/test1.mp3"   # only used by the
 SEPARATION_MODE = "channel"    # "diarize" (mono or stereo) | "channel" (true dual-channel)
 MODEL = "pyai-hear-telephony"
 
-POLL_INTERVAL_SECONDS = 2
-POLL_MAX_ATTEMPTS = 60
+# Poll PyAI async Hear jobs. Large/slow batches (and Hear backpressure) need
+# more than two minutes — we upload 8 kHz stereo copies, but STT still tracks
+# wall time + queue depth, not just upload size.
+POLL_INTERVAL_SECONDS = max(1, int(os.getenv("HEAR_POLL_INTERVAL_SECONDS", "3")))
+POLL_MAX_ATTEMPTS = max(1, int(os.getenv("HEAR_POLL_MAX_ATTEMPTS", "200")))  # default ~10 min
 
 # Telephony-sized copy for PyAI Hear only. Playback still uses the original file.
 # Must stay discrete-channel PCM (not MP3). Joint-stereo MP3 mixes L/R, and
@@ -492,6 +495,11 @@ def poll_job(job_id):
         return result
 
     last_status = None
+    budget_s = POLL_MAX_ATTEMPTS * POLL_INTERVAL_SECONDS
+    log.info(
+        "polling job %s (up to %ds, every %ds)",
+        job_id, budget_s, POLL_INTERVAL_SECONDS,
+    )
     for attempt in range(1, POLL_MAX_ATTEMPTS + 1):
         resp = pyai_usage.get(
             f"{BASE_URL}/v1/transcription/jobs/{job_id}", headers=HEADERS, timeout=30
