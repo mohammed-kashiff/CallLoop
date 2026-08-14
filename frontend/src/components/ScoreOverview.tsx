@@ -1,3 +1,4 @@
+import { capFirst, capWords } from '../lib/format'
 import type { AuditReport } from '../types'
 
 interface ScoreOverviewProps {
@@ -35,7 +36,7 @@ export function ScoreOverview({ report, animate }: ScoreOverviewProps) {
       <div className="score-copy">
         <h2 className="panel-title">{report.band}</h2>
         <p className="panel-lede">
-          {report.agentName} · {report.fileName}
+          {capWords(report.agentName)} · {capFirst(report.fileName)}
           {report.gateFailed ? ' · Review required' : ''}
         </p>
       </div>

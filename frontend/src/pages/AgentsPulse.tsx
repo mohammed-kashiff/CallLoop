@@ -8,9 +8,9 @@ import { Pipeline } from '../components/Pipeline'
 import { ScoreOverview } from '../components/ScoreOverview'
 import { TranscriptPlayer } from '../components/TranscriptPlayer'
 import { UploadZone } from '../components/UploadZone'
-import { Workspace } from '../components/Workspace'
+import { Workspace, callNoteScopeKey } from '../components/Workspace'
 import { useAudit } from '../context/AuditContext'
-import { formatTime } from '../lib/format'
+import { capFirst, capWords, formatTime } from '../lib/format'
 import type { BulkJob, CallListItem, JobStatus } from '../types'
 
 interface CallLaneRow {
@@ -185,11 +185,11 @@ export function AgentsPulse() {
               hint={report.band}
               tone="good"
             />
-            <KpiCard label="Grade" value={report.grade} hint={report.agentName} />
+            <KpiCard label="Grade" value={report.grade} hint={capWords(report.agentName)} />
             <KpiCard
               label="Churn"
-              value={report.churn.level}
-              hint="From the customer’s words"
+              value={capFirst(report.churn.level)}
+              hint="From The Customer’s Words"
               tone={
                 report.churn.level === 'high' || report.churn.level === 'medium'
                   ? 'warn'
@@ -197,9 +197,9 @@ export function AgentsPulse() {
               }
             />
             <KpiCard
-              label="To close"
+              label="To Close"
               value={String(closeItems.length)}
-              hint="coaching items"
+              hint="Coaching Items"
               tone="default"
             />
           </div>
@@ -229,11 +229,7 @@ export function AgentsPulse() {
           <Workspace
             activeId={tab}
             onActiveId={setTab}
-            noteScopeKey={
-              report.numericCallId != null
-                ? String(report.numericCallId)
-                : report.callId || null
-            }
+            noteScopeKey={callNoteScopeKey(report.numericCallId, report.callId)}
             tabs={[
               {
                 id: 'evaluation',
@@ -293,7 +289,7 @@ export function AgentsPulse() {
                               <h4 className="improvement-label">Service</h4>
                               <ul className="feedback-list">
                                 {report.feedback.aboutAgent.map((item) => (
-                                  <li key={item}>{item}</li>
+                                  <li key={item}>{capFirst(item)}</li>
                                 ))}
                               </ul>
                             </div>
@@ -301,7 +297,7 @@ export function AgentsPulse() {
                               <h4 className="improvement-label">Product</h4>
                               <ul className="feedback-list">
                                 {report.feedback.aboutProduct.map((item) => (
-                                  <li key={item}>{item}</li>
+                                  <li key={item}>{capFirst(item)}</li>
                                 ))}
                               </ul>
                             </div>
@@ -328,13 +324,13 @@ export function AgentsPulse() {
               },
               {
                 id: 'close',
-                label: 'Close the loop',
+                label: 'Close The Loop',
                 panel:
                   closeItems.length > 0 ? (
                     <ul className="tip-list">
                       {closeItems.map((item) => (
                         <li key={item}>
-                          <p>{item}</p>
+                          <p>{capFirst(item)}</p>
                         </li>
                       ))}
                     </ul>
@@ -352,7 +348,8 @@ export function AgentsPulse() {
           <div className="call-lane-head">
             <h2 className="panel-title">Calls</h2>
             <p className="panel-lede">
-              Showing {report.fileName || 'the latest call'} above. Scroll and open another.
+              Showing {capFirst(report.fileName) || 'the latest call'} above. Scroll and open
+              another.
             </p>
           </div>
           <ul className="call-lane-list">
@@ -380,7 +377,7 @@ export function AgentsPulse() {
                     }}
                   >
                     <span className="call-lane-name" title={row.name}>
-                      {row.name}
+                      {capFirst(row.name)}
                     </span>
                     <CallProgress
                       status={String(row.status)}

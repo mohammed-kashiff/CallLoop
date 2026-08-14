@@ -10,3 +10,18 @@ export function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
+
+/** Capitalize the first letter (keeps the rest as-is). */
+export function capFirst(raw: string | null | undefined): string {
+  const s = (raw ?? '').trim()
+  if (!s) return ''
+  return s.replace(/^([a-z])/, (ch) => ch.toUpperCase())
+}
+
+/** Capitalize the first letter of each word (e.g. speaker 2 → Speaker 2). */
+export function capWords(raw: string | null | undefined): string {
+  const s = (raw ?? '').trim()
+  if (!s) return ''
+  return s.replace(/\b([a-z])/g, (ch) => ch.toUpperCase())
+}
+

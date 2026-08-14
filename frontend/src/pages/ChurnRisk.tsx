@@ -1,9 +1,11 @@
-import { useNavigate } from 'react-router-dom'
+import { useMemo, useState } from 'react'
+import { Link, useNavigate } from 'react-router-dom'
+import { CallPicker } from '../components/CallPicker'
 import { ChurnCue } from '../components/LoopCues'
 import { SketchWallpaper } from '../components/SketchWallpaper'
 import { KpiCard } from '../components/KpiCard'
-import { Workspace } from '../components/Workspace'
-import { formatTime } from '../lib/format'
+import { Workspace, callNoteScopeKey } from '../components/Workspace'
+import { capFirst, capWords, formatTime } from '../lib/format'
 import { useAudit } from '../context/AuditContext'
 import type { ChurnLevel } from '../types'
 
@@ -16,8 +18,42 @@ const LEVELS: { level: ChurnLevel; label: string; hint: string }[] = [
 
 export function ChurnRisk() {
   const navigate = useNavigate()
-  const { report, showReport, onSeek } = useAudit()
+  const { report, showReport, calls, selectCall, running, onSeek } = useAudit()
   const { churn } = report
+  const [switching, setSwitching] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const callLabel = capFirst(report.fileName || report.callId || 'Current call')
+  const agentLabel = capWords(report.agentName)
+  const callIdLabel =
+    report.numericCallId != null ? `Call #${report.numericCallId}` : report.callId || ''
+
+  const auditedCalls = useMemo(
+    () =>
+      calls.filter((c) => c.has_audit || c.status === 'completed' || !c.status),
+    [calls],
+  )
+
+  const onPickCall = (id: number) => {
+    if (id === report.numericCallId) return
+    setError(null)
+    setSwitching(true)
+    void selectCall(id)
+      .catch((e: unknown) =>
+        setError(e instanceof Error ? e.message : 'Could not open that call.'),
+      )
+      .finally(() => setSwitching(false))
+  }
+
+  const callPicker =
+    auditedCalls.length > 0 ? (
+      <CallPicker
+        calls={auditedCalls}
+        value={report.numericCallId}
+        disabled={running || switching}
+        onChange={onPickCall}
+      />
+    ) : null
 
   return (
     <>
@@ -26,103 +62,132 @@ export function ChurnRisk() {
           <p className="crumb">Loop / Retention</p>
           <h1>Churn Risk</h1>
         </div>
+        {!showReport ? callPicker : null}
       </header>
+
+      {error && (
+        <p className="upload-error" role="alert">
+          {error}
+        </p>
+      )}
 
       {!showReport && (
         <div className="empty-card is-pulse">
           <SketchWallpaper variant="churn" />
           <ChurnCue />
           <p className="empty-title">No churn language yet</p>
-          <p className="empty-copy">Ingest a recording to score retention risk before renewal.</p>
+          <p className="empty-copy">
+            {auditedCalls.length
+              ? 'Pick a call above to score retention risk.'
+              : 'Ingest a recording to score retention risk before renewal.'}
+          </p>
         </div>
       )}
 
       {showReport && (
         <>
-          <div className="kpi-strip">
-        <KpiCard
-          label="Rating"
-          value={churn.level}
-          hint="From the driving quote"
-          tone={churn.level === 'high' || churn.level === 'medium' ? 'warn' : 'good'}
-        />
-        <KpiCard label="Agent" value={report.agentName} hint={report.fileName} />
-        <KpiCard
-          label="Actions"
-          value={String(report.summary.actionItems.length)}
-          hint="to close this loop"
-        />
-      </div>
+          <div className="call-context-banner" role="status">
+            <div className="call-context-copy">
+              <p className="call-context-kicker">Churn risk for this call</p>
+              <p className="call-context-title" title={callLabel}>
+                {callLabel}
+              </p>
+              <p className="call-context-meta">
+                {[callIdLabel, agentLabel ? `Agent · ${agentLabel}` : null]
+                  .filter(Boolean)
+                  .join(' · ')}
+              </p>
+              {callPicker}
+            </div>
+            <div className="call-context-actions">
+              <Link to="/agents-pulse" className="ghost-btn call-context-link">
+                Open in Agent Pulse
+              </Link>
+            </div>
+          </div>
 
-      <Workspace
-        noteScopeKey={
-          report.numericCallId != null
-            ? `churn-${report.numericCallId}`
-            : report.callId
-              ? `churn-${report.callId}`
-              : null
-        }
-        tabs={[
-          {
-            id: 'scale',
-            label: 'Scale',
-            panel: (
-              <div className="risk-meter" role="list">
-                {LEVELS.map((band) => (
-                  <div
-                    key={band.level}
-                    role="listitem"
-                    className={[
-                      'risk-seg',
-                      `churn-${band.level}`,
-                      band.level === churn.level ? 'is-current' : '',
-                    ]
-                      .filter(Boolean)
-                      .join(' ')}
-                  >
-                    <span className={`risk-seg-label churn-level churn-${band.level}`}>
-                      {band.label}
-                    </span>
-                    <span>{band.hint}</span>
+          <div className="kpi-strip">
+            <KpiCard
+              label="Rating"
+              value={capFirst(churn.level)}
+              hint="From The Driving Quote"
+              tone={churn.level === 'high' || churn.level === 'medium' ? 'warn' : 'good'}
+            />
+            <KpiCard
+              label="Agent"
+              value={agentLabel || '—'}
+              hint={capFirst(report.fileName)}
+            />
+            <KpiCard
+              label="Actions"
+              value={String(report.summary.actionItems.length)}
+              hint="To Close This Loop"
+            />
+          </div>
+
+          <Workspace
+            noteScopeKey={callNoteScopeKey(report.numericCallId, report.callId)}
+            tabs={[
+              {
+                id: 'scale',
+                label: 'Scale',
+                panel: (
+                  <div className="risk-meter" role="list">
+                    {LEVELS.map((band) => (
+                      <div
+                        key={band.level}
+                        role="listitem"
+                        className={[
+                          'risk-seg',
+                          `churn-${band.level}`,
+                          band.level === churn.level ? 'is-current' : '',
+                        ]
+                          .filter(Boolean)
+                          .join(' ')}
+                      >
+                        <span className={`risk-seg-label churn-level churn-${band.level}`}>
+                          {band.label}
+                        </span>
+                        <span>{band.hint}</span>
+                      </div>
+                    ))}
                   </div>
-                ))}
-              </div>
-            ),
-          },
-          {
-            id: 'quote',
-            label: 'Quote',
-            panel: (
-              <blockquote className="evidence">
-                {churn.quote ? <p>“{churn.quote}”</p> : <p>No driving quote on this call.</p>}
-                {churn.timestamp > 0 && (
-                  <button
-                    type="button"
-                    className="timestamp-btn"
-                    onClick={() => {
-                      onSeek(churn.timestamp)
-                      navigate('/agents-pulse')
-                    }}
-                  >
-                    Play at {formatTime(churn.timestamp)}
-                  </button>
-                )}
-              </blockquote>
-            ),
-          },
-          {
-            id: 'actions',
-            label: 'Close the loop',
-            panel: (
-              <ol className="action-items">
-                {report.summary.actionItems.map((item) => (
-                  <li key={item}>{item}</li>
-                ))}
-              </ol>
-            ),
-          },
-        ]}
-      />
+                ),
+              },
+              {
+                id: 'quote',
+                label: 'Quote',
+                panel: (
+                  <blockquote className="evidence">
+                    {churn.quote ? <p>“{churn.quote}”</p> : <p>No driving quote on this call.</p>}
+                    {churn.timestamp > 0 && (
+                      <button
+                        type="button"
+                        className="timestamp-btn"
+                        onClick={() => {
+                          onSeek(churn.timestamp)
+                          navigate('/agents-pulse')
+                        }}
+                      >
+                        Play at {formatTime(churn.timestamp)}
+                      </button>
+                    )}
+                  </blockquote>
+                ),
+              },
+              {
+                id: 'actions',
+                label: 'Close The Loop',
+                panel: (
+                  <ol className="action-items">
+                    {report.summary.actionItems.map((item) => (
+                      <li key={item}>{capFirst(item)}</li>
+                    ))}
+                  </ol>
+                ),
+              },
+            ]}
+          />
         </>
       )}
     </>

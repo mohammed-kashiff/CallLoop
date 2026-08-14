@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { Workspace } from '../components/Workspace'
 import { useAudit } from '../context/AuditContext'
 import { API, readError } from '../lib/api'
+import { capFirst, capWords } from '../lib/format'
 import type { FlaggedCallRow } from '../types'
 
 const PAGE_SIZES = [5, 10, 25] as const
@@ -106,9 +107,9 @@ function ReviewRow({
   return (
     <li className="review-item">
       <div className="review-main">
-        <p className="review-file">{item.fileName}</p>
+        <p className="review-file">{capFirst(item.fileName)}</p>
         <p className="review-meta">
-          {item.agentName} · {item.flaggedAt}
+          {capWords(item.agentName)} · {item.flaggedAt}
         </p>
         {noteOpen ? (
           <label className="review-note">

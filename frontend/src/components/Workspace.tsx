@@ -30,7 +30,17 @@ interface NoteTab {
 
 const NOTES_STORAGE_KEY = 'callproof.workspace-notes.v1'
 
-function readNotesStore(): Record<string, NoteTab[]> {
+/** Same call → same notes on Agent Pulse, Churn, Feedbacks, etc. */
+export function callNoteScopeKey(
+  numericCallId: number | null | undefined,
+  callId?: string | null,
+): string | null {
+  if (numericCallId != null) return String(numericCallId)
+  const id = (callId ?? '').trim()
+  return id || null
+}
+
+function readRawNotesStore(): Record<string, NoteTab[]> {
   try {
     const raw = localStorage.getItem(NOTES_STORAGE_KEY)
     if (!raw) return {}
@@ -50,6 +60,35 @@ function writeNotesStore(store: Record<string, NoteTab[]>) {
   }
 }
 
+/** Fold legacy page-prefixed keys (churn-3, feedback-3) into the bare call id. */
+function readNotesStore(): Record<string, NoteTab[]> {
+  const store = readRawNotesStore()
+  let dirty = false
+  const next: Record<string, NoteTab[]> = { ...store }
+
+  for (const key of Object.keys(store)) {
+    const m = /^(churn|feedback)-(.+)$/.exec(key)
+    if (!m) continue
+    const canonical = m[2]
+    const legacy = store[key] ?? []
+    const existing = next[canonical] ?? []
+    const byId = new Map<string, NoteTab>()
+    for (const n of existing) byId.set(n.id, n)
+    for (const n of legacy) {
+      const cur = byId.get(n.id)
+      if (!cur || (n.body?.length ?? 0) > (cur.body?.length ?? 0)) {
+        byId.set(n.id, n)
+      }
+    }
+    next[canonical] = Array.from(byId.values())
+    delete next[key]
+    dirty = true
+  }
+
+  if (dirty) writeNotesStore(next)
+  return next
+}
+
 export function Workspace({
   tabs,
   activeId,
@@ -61,6 +100,21 @@ export function Workspace({
   const scope = (noteScopeKey && String(noteScopeKey).trim()) || 'global'
   const [internal, setInternal] = useState(tabs[0]?.id ?? '')
   const [notesStore, setNotesStore] = useState<Record<string, NoteTab[]>>(() => readNotesStore())
+
+  // Stay in sync when another page/workspace writes the same call’s notes.
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== NOTES_STORAGE_KEY) return
+      setNotesStore(readNotesStore())
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [])
+
+  // Re-read when switching calls so we pick up migrations / other page writes in-tab.
+  useEffect(() => {
+    setNotesStore(readNotesStore())
+  }, [scope])
   const active = activeId ?? internal
 
   const notes = useMemo(() => notesStore[scope] ?? [], [notesStore, scope])
