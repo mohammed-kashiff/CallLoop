@@ -4,6 +4,10 @@ CallProof scores support calls against a soft-skills rubric. Agents (or managers
 
 Current product branch: **`v2testing-ui-final`**.
 
+<p align="center">
+  <img src="docs/call-loop-hackathon.png" alt="Call Loop — PyAI Hackathon · Team Foursight" width="720" />
+</p>
+
 ---
 
 ## What the product does
