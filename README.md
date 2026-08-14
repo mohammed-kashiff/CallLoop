@@ -48,53 +48,49 @@ UI brand in this branch: **Call Loop v3** (React + TypeScript + Vite).
 4. **Audit** — `GET /api/calls/{id}/audit` runs hybrid/full QA (rules + Claude).
 5. **Report** — score, grade, findings, churn; on-demand feedback / email / flag for review.
 
-Call Scoring system:
+## Call Scoring system:
 
-Score math (v8)
-Verdict points: pass = 1.0, partial = 0.5, fail = 0.0
+# Score math (v8)
+Verdict points: 
+pass = 1.0, partial = 0.5, fail = 0.0
 
-Dimension	Weight Method
+Dimension	Weight Method:
 
-Resolution Effectiveness
-40
-always LLM
+**Resolution Effectiveness**
+40 | always LLM
 
-Ownership & Next Steps
-20
-rules, then optional LLM
+**Ownership & Next Steps**
+20 |  rules, then optional LLM
 
-Active Listening
-20
-rules only
+**Active Listening**
+20 | rules only
 
-Tone, Empathy & Professionalism
-20
-rules, then optional LLM
+**Tone, Empathy & Professionalism**
+20 | rules, then optional LLM
 
-Total
-100
-Hostile language caps the overall score at 60.
+**Total**
+100 | Hostile language caps the overall score at 60.
 
-Bands
+##Bands
 
-Score	Label
-95–100
+**Score	Label
+95–100**
 
-Star Performer
-90–94
+**Star Performer
+90–94**
 
-Excelling
-80–89
+**Excelling
+80–89**
 
-Solid Performer
-70–79
+**Solid Performer
+70–79**
 
-Developing
-60–69
+**Developing
+60–69**
 
-Needs Improvement
+**Needs Improvement
 0–59
-Needs Immediate Attention
+Needs Immediate Attention**
 
 ### Main pieces
 
