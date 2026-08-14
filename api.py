@@ -468,16 +468,33 @@ def analyze_call(call_id, agent_override=None):
 def _load_or_compute_audit(call_id: int, refresh: bool = False):
     """Return (audit_dict, rubric_hash). Computes and caches on miss/refresh."""
     rh = _rubric_hash()
-    if not refresh:
-        with _db_lock:
-            with _conn() as c:
-                row = c.execute(
-                    "SELECT audit_json, rubric_hash FROM audits WHERE call_id=?",
-                    (call_id,),
-                ).fetchone()
-        if row and row["rubric_hash"] == rh:
-            return json.loads(row["audit_json"]), rh
+    prev = None
+    prev_hash = None
+    with _db_lock:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT audit_json, rubric_hash FROM audits WHERE call_id=?",
+                (call_id,),
+            ).fetchone()
+    if row:
+        prev_hash = row["rubric_hash"]
+        try:
+            prev = json.loads(row["audit_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            prev = None
+        if not refresh and prev_hash == rh and isinstance(prev, dict):
+            return prev, rh
     audit = analyze_call(call_id)
+    if isinstance(prev, dict) and prev.get("manual_review"):
+        audit["manual_review"] = True
+        audit["flagged"] = True
+        if prev.get("manual_review_at"):
+            audit["manual_review_at"] = prev["manual_review_at"]
+    if isinstance(prev, dict) and prev.get("review_solved"):
+        audit["flagged"] = True
+        audit["review_solved"] = True
+        if prev.get("review_solved_at"):
+            audit["review_solved_at"] = prev["review_solved_at"]
     with _db_lock:
         with _conn() as c:
             c.execute(
@@ -486,6 +503,57 @@ def _load_or_compute_audit(call_id: int, refresh: bool = False):
                 (call_id, json.dumps(audit), rh),
             )
     return audit, rh
+
+
+_FLAG_REASON_LABELS = {
+    "hostile_language_override": "hostile language",
+    "low_overall_score": "low overall score",
+}
+
+
+def _audit_is_flagged(audit) -> bool:
+    if not isinstance(audit, dict):
+        return False
+    return bool(
+        audit.get("flagged")
+        or audit.get("manual_review")
+        or (audit.get("manager_review") or [])
+        or (audit.get("gate_fails") or [])
+    )
+
+
+def _flag_sources(audit: dict) -> list[str]:
+    sources = []
+    if audit.get("manual_review"):
+        sources.append("manual")
+    auto = bool(audit.get("manager_review") or audit.get("gate_fails"))
+    if not auto and audit.get("flagged") and not audit.get("manual_review"):
+        auto = True
+    if auto:
+        sources.append("auto")
+    return sources
+
+
+def _flag_reason_text(audit: dict) -> str:
+    parts = []
+    if audit.get("manual_review"):
+        parts.append("manual flag")
+    for t in audit.get("manager_review") or []:
+        reason = t.get("reason") if isinstance(t, dict) else t
+        label = _FLAG_REASON_LABELS.get(reason, str(reason or "").replace("_", " "))
+        if label:
+            parts.append(label)
+    for g in audit.get("gate_fails") or []:
+        if not isinstance(g, str):
+            continue
+        label = _FLAG_REASON_LABELS.get(g, g.replace("_", " "))
+        if label:
+            parts.append(label)
+    seen = []
+    for p in parts:
+        if p and p not in seen:
+            seen.append(p)
+    return "; ".join(seen)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -715,6 +783,8 @@ def list_calls():
             "audit_fresh": False,
             "score": None,
             "grade": None,
+            "flagged": False,
+            "review_solved": False,
             "audited_at": r["audited_at"],
         }
         if r["audit_json"]:
@@ -724,6 +794,8 @@ def list_calls():
                 item["audit_fresh"] = r["rubric_hash"] == rh
                 item["score"] = cached.get("score")
                 item["grade"] = cached.get("grade")
+                item["flagged"] = _audit_is_flagged(cached)
+                item["review_solved"] = bool(cached.get("review_solved"))
             except (TypeError, json.JSONDecodeError):
                 item["has_audit"] = True
         out.append(item)
@@ -1044,6 +1116,57 @@ def _load_scorecard_records() -> list[dict]:
     return records
 
 
+@app.get("/api/calls/flagged")
+def list_flagged_calls():
+    """Scorecards flagged for manager review (manual button or auto triggers)."""
+    with _conn() as c:
+        rows = c.execute(
+            """
+            SELECT
+              c.id,
+              c.filename,
+              c.audio_seconds,
+              c.created_at,
+              a.audit_json,
+              a.created_at AS audited_at
+            FROM calls c
+            INNER JOIN audits a ON a.call_id = c.id
+            ORDER BY c.id DESC
+            """
+        ).fetchall()
+    out = []
+    for r in rows:
+        try:
+            audit = json.loads(r["audit_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not _audit_is_flagged(audit):
+            continue
+        fname = (r["filename"] or "").strip() or f"call-{r['id']}.mp3"
+        recap = audit.get("recap") if isinstance(audit.get("recap"), dict) else {}
+        out.append({
+            "id": r["id"],
+            "filename": fname,
+            "score": audit.get("score"),
+            "grade": audit.get("grade") or "",
+            "agent_name": _agent_display_name(audit),
+            "audio_seconds": r["audio_seconds"],
+            "flagged": True,
+            "manual_review": bool(audit.get("manual_review")),
+            "solved": bool(audit.get("review_solved")),
+            "sources": _flag_sources(audit),
+            "reasons": _flag_reason_text(audit),
+            "recap_tldr": (recap.get("tldr") or recap.get("headline") or "").strip(),
+            "created_at": r["created_at"],
+            "audited_at": r["audited_at"],
+            "manual_review_at": audit.get("manual_review_at"),
+            "review_solved_at": audit.get("review_solved_at"),
+        })
+    pending = sum(1 for i in out if not i["solved"])
+    applog.event(log, "flagged_list", count=len(out), pending=pending, solved=len(out) - pending)
+    return out
+
+
 @app.get("/api/calls/export-scorecard")
 def export_scorecard():
     """Scorecard spreadsheet: recording id/name, agent, overall score (colored),
@@ -1199,6 +1322,102 @@ def _save_audit(call_id: int, audit: dict, rh: str):
             "VALUES (?, ?, ?)",
             (call_id, json.dumps(audit), rh),
         )
+
+
+@app.post("/api/calls/{call_id}/flag")
+def flag_call_for_review(call_id: int):
+    """Persist a manual manager-review flag on the stored scorecard."""
+    if call_id < 1:
+        raise HTTPException(status_code=400, detail="Invalid call id.")
+    with _conn() as c:
+        row = c.execute(
+            "SELECT audit_json, rubric_hash FROM audits WHERE call_id=?",
+            (call_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="No scorecard for this call. Score it before flagging.",
+        )
+    try:
+        audit = json.loads(row["audit_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        raise HTTPException(status_code=500, detail="Stored scorecard is not valid JSON.")
+    if not isinstance(audit, dict):
+        raise HTTPException(status_code=500, detail="Stored scorecard is not valid JSON.")
+    already = bool(audit.get("manual_review"))
+    audit["flagged"] = True
+    audit["manual_review"] = True
+    audit["review_solved"] = False
+    audit["review_solved_at"] = None
+    if not audit.get("manual_review_at"):
+        audit["manual_review_at"] = datetime.now(timezone.utc).isoformat()
+    rh = row["rubric_hash"] or _rubric_hash()
+    _save_audit(call_id, audit, rh)
+    applog.event(
+        log, "call_flagged",
+        call_id=call_id,
+        source="manual",
+        already=already,
+    )
+    log.info("call %d flagged for manual review", call_id)
+    return {
+        "status": "ok",
+        "call_id": call_id,
+        "flagged": True,
+        "manual_review": True,
+        "solved": False,
+        "reasons": _flag_reason_text(audit),
+        "already": already,
+    }
+
+
+@app.post("/api/calls/{call_id}/solve")
+def solve_flagged_review(call_id: int):
+    """Move a flagged scorecard from Pending to Solved."""
+    if call_id < 1:
+        raise HTTPException(status_code=400, detail="Invalid call id.")
+    with _conn() as c:
+        row = c.execute(
+            "SELECT audit_json, rubric_hash FROM audits WHERE call_id=?",
+            (call_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="No scorecard for this call.",
+        )
+    try:
+        audit = json.loads(row["audit_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        raise HTTPException(status_code=500, detail="Stored scorecard is not valid JSON.")
+    if not isinstance(audit, dict):
+        raise HTTPException(status_code=500, detail="Stored scorecard is not valid JSON.")
+    if not _audit_is_flagged(audit):
+        raise HTTPException(
+            status_code=400,
+            detail="This call is not in the review queue.",
+        )
+    already = bool(audit.get("review_solved"))
+    audit["flagged"] = True
+    audit["review_solved"] = True
+    if not audit.get("review_solved_at"):
+        audit["review_solved_at"] = datetime.now(timezone.utc).isoformat()
+    rh = row["rubric_hash"] or _rubric_hash()
+    _save_audit(call_id, audit, rh)
+    applog.event(
+        log, "review_solved",
+        call_id=call_id,
+        already=already,
+    )
+    log.info("call %d review marked solved", call_id)
+    return {
+        "status": "ok",
+        "call_id": call_id,
+        "flagged": True,
+        "solved": True,
+        "already": already,
+    }
 
 
 def _ensure_retention_draft(call_id: int, audit: dict, rh: str) -> dict:

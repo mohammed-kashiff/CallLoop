@@ -1,7 +1,15 @@
 import { useState, useEffect, useRef, Fragment } from "react";
 import JSZip from "jszip";
 import { getHearFfmpeg, transcodeHearCopy } from "./hearTranscode";
+import ReviewQueue from "./ReviewQueue";
 import "./App.css";
+
+function readReviewRoute() {
+  const raw = (window.location.hash || "").replace(/^#/, "");
+  const m = /^\/review(?:\/(\d+))?\/?$/.exec(raw);
+  if (!m) return { page: "home", focusId: null };
+  return { page: "review", focusId: m[1] ? Number(m[1]) : null };
+}
 
 const API = "http://localhost:8000";
 const MAX_UPLOAD_MB = 25;
@@ -180,6 +188,9 @@ export default function App() {
   const [exportingScorecard, setExportingScorecard] = useState(false);
   const [manualReviewFlagged, setManualReviewFlagged] = useState(false);
   const [manualReviewMessage, setManualReviewMessage] = useState(null);
+  const [flaggingReview, setFlaggingReview] = useState(false);
+  const [page, setPage] = useState(() => readReviewRoute().page);
+  const [reviewFocusId, setReviewFocusId] = useState(() => readReviewRoute().focusId);
   const [pyaiStatus, setPyaiStatus] = useState(null);
   const [showDevLogs, setShowDevLogs] = useState(false);
   const [devLogLines, setDevLogLines] = useState([]);
@@ -235,6 +246,29 @@ export default function App() {
         setDevLogError(e.message || "Could not load logs.");
       })
       .finally(() => setDevLogLoading(false));
+  }
+
+  useEffect(() => {
+    const onHash = () => {
+      const r = readReviewRoute();
+      setPage(r.page);
+      setReviewFocusId(r.focusId);
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  function goHome() {
+    if ((window.location.hash || "").replace(/^#/, "")) {
+      window.location.hash = "";
+    } else {
+      setPage("home");
+      setReviewFocusId(null);
+    }
+  }
+
+  function goReview(id = null) {
+    window.location.hash = id != null ? `#/review/${id}` : "#/review";
   }
 
   useEffect(() => {
@@ -688,13 +722,32 @@ export default function App() {
     }
   }
 
-  function flagForManualReview() {
-    if (callId == null || manualReviewFlagged) return;
-    // Manual override (audit may already auto-flag via manager_review triggers).
-    setManualReviewFlagged(true);
-    setManualReviewMessage(
-      `Call #${callId} flagged for manual review.`,
-    );
+  async function flagForManualReview() {
+    if (callId == null || flaggingReview) return;
+    setFlaggingReview(true);
+    setError(null);
+    try {
+      const r = await fetch(`${API}/api/calls/${callId}/flag`, { method: "POST" });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        const detail =
+          typeof d.detail === "string" ? d.detail : "Could not flag this call.";
+        throw new Error(detail);
+      }
+      setManualReviewFlagged(true);
+      setManualReviewMessage(`Call #${callId} flagged for manual review.`);
+      setAudit((prev) =>
+        prev
+          ? { ...prev, flagged: true, manual_review: true, review_solved: false }
+          : prev,
+      );
+      await refreshCalls().catch(() => {});
+      goReview(callId);
+    } catch (e) {
+      setError(e.message || "Could not flag this call.");
+    } finally {
+      setFlaggingReview(false);
+    }
   }
 
   const segBySeq = {};
@@ -726,6 +779,7 @@ export default function App() {
 
   const jobActive = uploading || loading || pipelineActive || bulkRunning;
   const hasAuditedCalls = calls.some((c) => c.has_audit);
+  const flaggedCount = calls.filter((c) => c.flagged && !c.review_solved).length;
   const jobPhase = uploading
     ? "transcribe"
     : loading || pipelineActive
@@ -760,9 +814,13 @@ export default function App() {
                   type="button"
                   className={`flag-review ${manualReviewFlagged ? "flagged" : ""}`}
                   onClick={flagForManualReview}
-                  disabled={manualReviewFlagged}
+                  disabled={flaggingReview || jobActive}
                 >
-                  {manualReviewFlagged ? "Flagged" : "Flag for review"}
+                  {flaggingReview
+                    ? "Flagging…"
+                    : manualReviewFlagged
+                      ? "Open review queue"
+                      : "Flag for review"}
                 </button>
                 {manualReviewMessage && (
                   <div className="flag-review-msg">{manualReviewMessage}</div>
@@ -1085,7 +1143,18 @@ export default function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <div className="brand">
+        <div
+          className="brand"
+          role="button"
+          tabIndex={0}
+          onClick={goHome}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              goHome();
+            }
+          }}
+        >
           <span className="logo" aria-hidden="true">
             <span className="logo-ring" />
             <span className="logo-dot" />
@@ -1128,10 +1197,23 @@ export default function App() {
           )}
           <button
             type="button"
-            className={`library-toggle ${showLibrary ? "on" : ""}`}
-            onClick={() => setShowLibrary((v) => !v)}
+            className={`library-toggle ${showLibrary && page !== "review" ? "on" : ""}`}
+            onClick={() => {
+              if (page === "review") goHome();
+              setShowLibrary((v) => (page === "review" ? true : !v));
+            }}
           >
-            {showLibrary ? "Hide calls" : "All calls"}
+            {showLibrary && page !== "review" ? "Hide calls" : "All calls"}
+          </button>
+          <button
+            type="button"
+            className={`library-toggle ${page === "review" ? "on" : ""}`}
+            onClick={() => goReview()}
+          >
+            Review queue
+            {flaggedCount > 0 && (
+              <span className="review-count">{flaggedCount}</span>
+            )}
           </button>
           <button
             type="button"
@@ -1182,6 +1264,19 @@ export default function App() {
         </div>
       </header>
 
+      {page === "review" ? (
+        <ReviewQueue
+          api={API}
+          focusCallId={reviewFocusId}
+          onBack={goHome}
+          onQueueChange={() => refreshCalls().catch(() => {})}
+          onOpenCall={(id) => {
+            setCallId(id);
+            goHome();
+          }}
+        />
+      ) : (
+      <>
       {showLibrary && (
         <section className="calls-library" aria-label="Stored calls library">
           <div className="calls-library-head">
@@ -1425,6 +1520,8 @@ export default function App() {
             onTimeUpdate={(e) => setNow(e.target.currentTime)}
           />
         </footer>
+      )}
+      </>
       )}
 
       <div className={`dev-logs-fab-wrap${showDevLogs ? " open" : ""}`}>
