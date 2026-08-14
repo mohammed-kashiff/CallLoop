@@ -2,7 +2,7 @@
 
 CallProof scores support calls against a soft-skills rubric. Agents (or managers) upload recordings; the stack transcribes them with **PyAI Hear**, evaluates them with **Claude** (and hybrid rules), then shows a scorecard, churn signals, coaching-style feedback, and a review queue in the **Call Loop** UI.
 
-Current product branch: **`v2testing-ui-final`**.
+Public repo: **[CallLoop](https://github.com/mohammed-kashiff/CallLoop)** · branch **`main`**.
 
 <p align="center">
   <img src="docs/call-loop-hackathon.png" alt="Call Loop — PyAI Hackathon · Team Foursight" width="720" />
@@ -82,7 +82,7 @@ You always need an **`ANTHROPIC_API_KEY`** for Claude scoring — paste your rea
 
 ## Install & run (every terminal command)
 
-Use **two terminal tabs**. Commands use `~/callproof` — adjust if your clone lives elsewhere.
+Use **two terminal tabs**. Commands use `~/CallLoop` — adjust if your clone lives elsewhere.
 
 ### Prerequisites
 
@@ -106,18 +106,18 @@ npm --version
 ### A. Clone and enter the repo
 
 ```bash
-git clone https://github.com/mohammed-kashiff/callproof.git
-cd callproof
-git checkout v2testing-ui-final
-git pull origin v2testing-ui-final
+git clone https://github.com/mohammed-kashiff/CallLoop
+cd CallLoop
+git checkout main
+git pull origin main
 ```
 
 If you already have the repo:
 
 ```bash
-cd ~/callproof
-git checkout v2testing-ui-final
-git pull origin v2testing-ui-final
+cd ~/CallLoop
+git checkout main
+git pull origin main
 ```
 
 ---
@@ -125,7 +125,7 @@ git pull origin v2testing-ui-final
 ### B. Python backend (sandbox-friendly)
 
 ```bash
-cd ~/callproof
+cd ~/CallLoop
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
@@ -138,7 +138,7 @@ Create env file:
 cp .env.example .env
 ```
 
-Edit `.env` (open in any editor). Minimum for Claude scoring:
+Edit `.env` (any editor — on macOS you can use `open -e .env`). Minimum for Claude scoring:
 
 ```bash
 # Required for QA — paste your real Anthropic key (never commit .env)
@@ -165,7 +165,7 @@ COST_CLAUDE_USD_PER_HIT=0.02
 Start the API (**Terminal 1** — leave it running):
 
 ```bash
-cd ~/callproof
+cd ~/CallLoop
 source .venv/bin/activate
 uvicorn api:app --reload --port 8000
 ```
@@ -195,7 +195,7 @@ curl -s http://127.0.0.1:8000/api/pyai/status | head
 **Terminal 2:**
 
 ```bash
-cd ~/callproof/frontend
+cd ~/CallLoop/frontend
 npm install
 npm run dev
 ```
@@ -211,7 +211,7 @@ Open that URL in your browser.
 **Terminal 1 — API**
 
 ```bash
-cd ~/callproof
+cd ~/CallLoop
 source .venv/bin/activate
 uvicorn api:app --reload --port 8000
 ```
@@ -219,18 +219,18 @@ uvicorn api:app --reload --port 8000
 **Terminal 2 — UI**
 
 ```bash
-cd ~/callproof/frontend
+cd ~/CallLoop/frontend
 npm run dev
 ```
 
 ---
 
-### E. Update to latest `v2testing-ui-final`
+### E. Update to latest `main`
 
 ```bash
-cd ~/callproof
-git checkout v2testing-ui-final
-git pull origin v2testing-ui-final
+cd ~/CallLoop
+git checkout main
+git pull origin main
 source .venv/bin/activate
 pip install -r requirements.txt
 cd frontend
