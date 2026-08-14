@@ -244,6 +244,40 @@ button {
   color: var(--text-soft);
 }
 
+.cost-today-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: rgba(11, 13, 16, 0.55);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.01em;
+}
+
+.cost-today-label {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10px;
+  opacity: 0.85;
+}
+
+.cost-today-value {
+  color: var(--text-soft);
+  font-family: var(--font-mono);
+  font-weight: 650;
+}
+
+.calls-library-table .call-cost {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-soft);
+  white-space: nowrap;
+}
+
 .dev-logs-fab-wrap {
   position: fixed;
   right: 16px;

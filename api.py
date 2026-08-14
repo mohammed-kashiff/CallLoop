@@ -51,6 +51,7 @@ import transcribe
 import recap as pyai_recap
 import email_notify
 import pyai_usage
+import cost_estimate
 
 logging.basicConfig(
     level=logging.INFO,
@@ -599,9 +600,12 @@ def pyai_status():
             parts.append(f"Claude {stats['claude_hits']}")
         if stats["pyai_units"]:
             parts.append(f"{stats['pyai_units']:g} units")
+        spend = cost_estimate.today_from_usage(usage)
         out = {
             "usage": usage,
             "usage_label": " · ".join(parts),
+            "cost_today": spend,
+            "cost_label": spend.get("label"),
             **stats,
         }
         out.update(extra)
@@ -798,6 +802,10 @@ def list_calls():
                 item["review_solved"] = bool(cached.get("review_solved"))
             except (TypeError, json.JSONDecodeError):
                 item["has_audit"] = True
+        item["cost"] = cost_estimate.estimate_call_cost(
+            item.get("audio_seconds"),
+            has_audit=bool(item.get("has_audit")),
+        )
         out.append(item)
     return out
 

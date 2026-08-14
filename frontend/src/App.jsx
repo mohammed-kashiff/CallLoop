@@ -73,6 +73,19 @@ function callLabel(c) {
   return name || `call-${c?.id}.mp3`;
 }
 
+function fmtUsd(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "—";
+  if (v < 0.01 && v > 0) return `~$${v.toFixed(3)}`;
+  return `~$${v.toFixed(2)}`;
+}
+
+function callCostLabel(c) {
+  const total = c?.cost?.total_usd;
+  if (total == null) return "";
+  return fmtUsd(total);
+}
+
 function methodLabel(method) {
   if (!method) return "scored";
   if (method === "deterministic_hybrid") return "Hybrid rules";
@@ -835,6 +848,13 @@ export default function App() {
               {" · agent "}
               {audit.agent_speaker}
               {audit.audit_mode ? ` · ${audit.audit_mode} audit` : ""}
+              {(() => {
+                const row = calls.find((c) => c.id === audit.call_id);
+                const cost = row?.cost;
+                return cost
+                  ? ` · est. ${fmtUsd(cost.total_usd)}`
+                  : "";
+              })()}
             </div>
 
             <section className={`churn churn-${churnRisk}`}>
@@ -1169,6 +1189,9 @@ export default function App() {
               title={
                 [
                   pyaiStatus.usage_label,
+                  pyaiStatus.cost_today
+                    ? `Est. today PyAI ${fmtUsd(pyaiStatus.cost_today.pyai_usd)} · Claude ${fmtUsd(pyaiStatus.cost_today.claude_usd)} · total ${fmtUsd(pyaiStatus.cost_today.total_usd)} (UTC, approximate)`
+                    : null,
                   pyaiStatus.limits
                     ? `rps ${pyaiStatus.limits.rps ?? "—"} · burst ${pyaiStatus.limits.burst ?? "—"} · concurrency ${pyaiStatus.limits.concurrency ?? "—"}`
                     : null,
@@ -1192,6 +1215,25 @@ export default function App() {
               </span>
               <span className="pyai-quota-text">
                 {pyaiStatus.quota_label || "—"}
+              </span>
+            </div>
+          )}
+          {pyaiStatus?.cost_today && (
+            <div
+              className="cost-today-chip"
+              title={
+                [
+                  "Approximate spend today (UTC), not a provider invoice.",
+                  `PyAI ${fmtUsd(pyaiStatus.cost_today.pyai_usd)} (${pyaiStatus.cost_today.pyai_basis || "usage"})`,
+                  `Claude ${fmtUsd(pyaiStatus.cost_today.claude_usd)} (${pyaiStatus.cost_today.claude_hits ?? 0} hits)`,
+                  "Tune COST_* rates in .env",
+                ].join(" · ")
+              }
+              role="status"
+            >
+              <span className="cost-today-label">Today</span>
+              <span className="cost-today-value">
+                {fmtUsd(pyaiStatus.cost_today.total_usd)}
               </span>
             </div>
           )}
@@ -1255,6 +1297,9 @@ export default function App() {
                     <option key={c.id} value={c.id}>
                       {callLabel(c)} · {fmtTime(c.audio_seconds)}
                       {scoreLabel}
+                      {c.cost?.total_usd != null
+                        ? ` · ${callCostLabel(c)}`
+                        : ""}
                     </option>
                   );
                 })}
@@ -1316,6 +1361,7 @@ export default function App() {
                     <th>Call</th>
                     <th>Status</th>
                     <th>Duration</th>
+                    <th>Est. cost</th>
                     <th>Speakers</th>
                     <th>Segments</th>
                     <th>Score</th>
@@ -1344,6 +1390,16 @@ export default function App() {
                           </span>
                         </td>
                         <td>{fmtTime(c.audio_seconds)}</td>
+                        <td
+                          className="call-cost"
+                          title={
+                            c.cost
+                              ? `Approx PyAI ${fmtUsd(c.cost.pyai_usd)} + Claude ${fmtUsd(c.cost.claude_usd)} (estimate)`
+                              : "Estimate unavailable"
+                          }
+                        >
+                          {c.cost ? callCostLabel(c) : "—"}
+                        </td>
                         <td>{c.speakers ?? "—"}</td>
                         <td>{c.segment_count ?? "—"}</td>
                         <td>
