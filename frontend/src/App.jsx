@@ -1464,7 +1464,7 @@ export default function App() {
                       </tr>
                       {active && (
                         <tr key={`${c.id}-audit`} className="library-audit-row">
-                          <td colSpan={9}>
+                          <td colSpan={10}>
                             {loading && !audit && (
                               <p className="library-audit-loading">Loading audit…</p>
                             )}
