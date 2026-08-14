@@ -333,14 +333,18 @@ export default function App() {
       })
       .then((data) => {
         setAudit(data);
-        if (data.flagged || (data.manager_review && data.manager_review.length)) {
+        if (data.flagged || data.manual_review || (data.manager_review && data.manager_review.length)) {
           setManualReviewFlagged(true);
-          const reasons = formatReviewReasons(data.manager_review);
-          setManualReviewMessage(
-            reasons
-              ? `Auto-flagged for manager review: ${reasons}.`
-              : `Call #${id} flagged for manual review.`,
-          );
+          if (data.review_solved) {
+            setManualReviewMessage("Review solved.");
+          } else {
+            const reasons = formatReviewReasons(data.manager_review);
+            setManualReviewMessage(
+              reasons
+                ? `In the review queue: ${reasons}.`
+                : `In the review queue.`,
+            );
+          }
         }
       })
       .catch(() => setError("Could not load the audit for this call."))
@@ -737,6 +741,7 @@ export default function App() {
 
   async function flagForManualReview() {
     if (callId == null || flaggingReview) return;
+    if (manualReviewFlagged) return;
     setFlaggingReview(true);
     setError(null);
     try {
@@ -748,14 +753,13 @@ export default function App() {
         throw new Error(detail);
       }
       setManualReviewFlagged(true);
-      setManualReviewMessage(`Call #${callId} flagged for manual review.`);
+      setManualReviewMessage("In the review queue.");
       setAudit((prev) =>
         prev
           ? { ...prev, flagged: true, manual_review: true, review_solved: false }
           : prev,
       );
       await refreshCalls().catch(() => {});
-      goReview(callId);
     } catch (e) {
       setError(e.message || "Could not flag this call.");
     } finally {
@@ -827,13 +831,15 @@ export default function App() {
                   type="button"
                   className={`flag-review ${manualReviewFlagged ? "flagged" : ""}`}
                   onClick={flagForManualReview}
-                  disabled={flaggingReview || jobActive}
+                  disabled={flaggingReview || jobActive || manualReviewFlagged}
                 >
                   {flaggingReview
                     ? "Flagging…"
-                    : manualReviewFlagged
-                      ? "Open review queue"
-                      : "Flag for review"}
+                    : audit.review_solved
+                      ? "Solved"
+                      : manualReviewFlagged
+                        ? "In review queue"
+                        : "Flag for review"}
                 </button>
                 {manualReviewMessage && (
                   <div className="flag-review-msg">{manualReviewMessage}</div>
@@ -1314,7 +1320,19 @@ export default function App() {
           api={API}
           focusCallId={reviewFocusId}
           onBack={goHome}
-          onQueueChange={() => refreshCalls().catch(() => {})}
+          onQueueChange={(id) => {
+            refreshCalls().catch(() => {});
+            if (id == null) return;
+            setAudit((prev) =>
+              prev && prev.call_id === id
+                ? { ...prev, flagged: true, review_solved: true }
+                : prev,
+            );
+            if (callId === id) {
+              setManualReviewFlagged(true);
+              setManualReviewMessage("Review solved.");
+            }
+          }}
           onOpenCall={(id) => {
             setCallId(id);
             goHome();
@@ -1365,6 +1383,7 @@ export default function App() {
                     <th>Speakers</th>
                     <th>Segments</th>
                     <th>Score</th>
+                    <th>Review</th>
                     <th>Stored</th>
                     <th />
                   </tr>
@@ -1413,6 +1432,15 @@ export default function App() {
                             <span className="muted">not audited</span>
                           )}
                         </td>
+                        <td>
+                          {c.flagged ? (
+                            <span className={`lib-pill ${c.review_solved ? "review-solved" : "review-pending"}`}>
+                              {c.review_solved ? "Solved" : "In review queue"}
+                            </span>
+                          ) : (
+                            <span className="muted">—</span>
+                          )}
+                        </td>
                         <td className="muted small">
                           {(c.created_at || "").replace("T", " ").slice(0, 19) || "—"}
                         </td>
@@ -1436,7 +1464,7 @@ export default function App() {
                       </tr>
                       {active && (
                         <tr key={`${c.id}-audit`} className="library-audit-row">
-                          <td colSpan={8}>
+                          <td colSpan={9}>
                             {loading && !audit && (
                               <p className="library-audit-loading">Loading audit…</p>
                             )}

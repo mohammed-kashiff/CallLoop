@@ -1353,11 +1353,14 @@ def flag_call_for_review(call_id: int):
         raise HTTPException(status_code=500, detail="Stored scorecard is not valid JSON.")
     if not isinstance(audit, dict):
         raise HTTPException(status_code=500, detail="Stored scorecard is not valid JSON.")
-    already = bool(audit.get("manual_review"))
+    already = _audit_is_flagged(audit)
+    already_manual = bool(audit.get("manual_review"))
+    already_solved = bool(audit.get("review_solved"))
     audit["flagged"] = True
     audit["manual_review"] = True
-    audit["review_solved"] = False
-    audit["review_solved_at"] = None
+    if not already:
+        audit["review_solved"] = False
+        audit["review_solved_at"] = None
     if not audit.get("manual_review_at"):
         audit["manual_review_at"] = datetime.now(timezone.utc).isoformat()
     rh = row["rubric_hash"] or _rubric_hash()
@@ -1366,7 +1369,8 @@ def flag_call_for_review(call_id: int):
         log, "call_flagged",
         call_id=call_id,
         source="manual",
-        already=already,
+        already=already_manual,
+        solved=bool(audit.get("review_solved")),
     )
     log.info("call %d flagged for manual review", call_id)
     return {
@@ -1374,9 +1378,9 @@ def flag_call_for_review(call_id: int):
         "call_id": call_id,
         "flagged": True,
         "manual_review": True,
-        "solved": False,
+        "solved": bool(audit.get("review_solved")),
         "reasons": _flag_reason_text(audit),
-        "already": already,
+        "already": already_manual or already_solved,
     }
 
 

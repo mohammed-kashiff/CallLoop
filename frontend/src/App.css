@@ -607,6 +607,16 @@ button {
   color: #fca5a5;
 }
 
+.lib-pill.review-pending {
+  background: var(--amber-soft);
+  color: #fdba74;
+}
+
+.lib-pill.review-solved {
+  background: var(--green-soft);
+  color: var(--green-ink);
+}
+
 .calls-library-hint {
   margin: 10px 0 0;
   font-size: 12px;

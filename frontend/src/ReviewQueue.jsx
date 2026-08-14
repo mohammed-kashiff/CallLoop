@@ -309,7 +309,7 @@ export default function ReviewQueue({ api, focusCallId, onBack, onOpenCall, onQu
       );
       setTab("solved");
       setOpenId(id);
-      if (onQueueChange) onQueueChange();
+      if (onQueueChange) onQueueChange(id);
     } catch (e) {
       setError(e.message || "Could not solve this review.");
     } finally {
