@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import csv
 import io
+import re
 import json
 import hashlib
 import logging
@@ -30,6 +31,7 @@ import zipfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from xml.sax.saxutils import escape as xml_escape
 
 import httpx
 from dotenv import load_dotenv
@@ -60,7 +62,8 @@ log = logging.getLogger("callproof.api")
 DB_PATH = qa.DB_PATH
 AUDIO_DIR = "audio"
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
-MAX_BULK_FILES = 20
+MAX_BULK_FILES = 100
+MAX_BULK_WORKERS = 20
 MAX_BATCH_ZIP_BYTES = MAX_UPLOAD_BYTES * MAX_BULK_FILES
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm", ".mpeg", ".mpga", ".aac"}
 _db_lock = threading.Lock()
@@ -269,7 +272,7 @@ def _startup():
     if not (os.environ.get("ANTHROPIC_API_KEY") or "").strip():
         log.warning(
             "ANTHROPIC_API_KEY is not set.\n"
-            "   ➤ The QA engine and coaching tips need this.\n"
+            "   ➤ The QA engine needs this.\n"
             "   ➤ Get one at https://console.anthropic.com and add to .env"
         )
 
@@ -302,7 +305,7 @@ def _rubric_hash():
     body += (
         f"\naudit_mode={qa.audit_mode()}\nrole=channel\nmodel={qa.MODEL}\n"
         f"claude_effort={getattr(qa, 'CLAUDE_EFFORT', 'high')}\n"
-        f"rules_rev=own_emp_pro_scope_v1\n"
+        f"rules_rev=tone_banks_v3\n"
     ).encode("utf-8")
     return hashlib.sha256(body).hexdigest()[:16]
 
@@ -373,7 +376,7 @@ def analyze_call(call_id, agent_override=None):
         criteria_arg = rubric["criteria"]
 
     # One parallel wave: dimensions/criteria + churn + Recap.
-    # Retention email, coaching tips, and customer feedback are on-demand.
+    # Retention email and areas of improvement are on-demand.
     with ThreadPoolExecutor(max_workers=2) as pool:
         wave_f = pool.submit(
             qa.run_parallel_claude_wave,
@@ -399,7 +402,7 @@ def analyze_call(call_id, agent_override=None):
     churn = wave.get("churn")
     feedback = wave.get("feedback")
     manager_review = wave.get("manager_review") or []
-    # On-demand — drafted when Email stakeholder / Get tips is used
+    # On-demand — drafted when Email stakeholder is used
     retention_email = {"status": "pending"}
 
     if wave.get("mode") == "v8":
@@ -456,7 +459,6 @@ def analyze_call(call_id, agent_override=None):
         "gate_fails": gate_fails, "flagged": flagged,
         "manager_review": manager_review,
         "segments": segments, "findings": findings,
-        "coaching": [],
         "churn": churn, "feedback": feedback,
         "retention_email": retention_email, "recap": call_recap,
         "audit_mode": qa.audit_mode(),
@@ -484,22 +486,6 @@ def _load_or_compute_audit(call_id: int, refresh: bool = False):
                 (call_id, json.dumps(audit), rh),
             )
     return audit, rh
-
-
-def _weak_from_findings(findings):
-    weak = []
-    for f in findings or []:
-        if f.get("verdict") not in ("fail", "partial", "unverified"):
-            continue
-        weak.append((
-            {"name": f.get("name", "Criterion")},
-            {
-                "verdict": f["verdict"],
-                "reasoning": f.get("reasoning", ""),
-                "evidence_text": f.get("evidence_text"),
-            },
-        ))
-    return weak
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -744,23 +730,72 @@ def list_calls():
     return out
 
 
-def _coaching_export_text(audit: dict) -> str:
-    """Prefer on-demand coaching tips; fall back to per-finding coaching notes."""
-    tips = []
-    for c in audit.get("coaching") or []:
-        crit = (c.get("criterion") or "").strip()
-        tip = (c.get("tip") or "").strip()
-        if tip:
-            tips.append(f"{crit}: {tip}" if crit else tip)
-    if tips:
-        return " | ".join(tips)
+def _playback_root() -> str:
+    return os.path.realpath(AUDIO_DIR)
 
-    for f in audit.get("findings") or []:
-        note = (f.get("coaching_note") or "").strip()
-        if note:
-            name = (f.get("name") or f.get("id") or "Finding").strip()
-            tips.append(f"{name}: {note}")
-    return " | ".join(tips)
+
+def _clear_playback_audio() -> int:
+    """Delete playback copies and batch temps under audio/. Keeps the folder."""
+    root = _playback_root()
+    if not os.path.isdir(root):
+        return 0
+    removed = 0
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        real = os.path.realpath(path)
+        if not real.startswith(root + os.sep):
+            log.warning("skipping audio path outside %s", AUDIO_DIR)
+            continue
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+                removed += 1
+            elif os.path.isfile(path) or os.path.islink(path):
+                os.remove(path)
+                removed += 1
+        except OSError as e:
+            log.warning("could not remove %s: %s", path, e)
+    return removed
+
+
+@app.post("/api/cache/clear")
+def clear_cache():
+    """Delete stored transcripts, scorecards, and playback audio so the next
+    upload transcribes and scores from scratch."""
+    with _db_lock:
+        with _conn() as c:
+            n_calls = c.execute("SELECT COUNT(*) FROM calls").fetchone()[0]
+            n_segments = c.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
+            n_audits = c.execute("SELECT COUNT(*) FROM audits").fetchone()[0]
+            c.execute("DELETE FROM audits")
+            c.execute("DELETE FROM segments")
+            c.execute("DELETE FROM calls")
+            try:
+                c.execute(
+                    "DELETE FROM sqlite_sequence WHERE name IN (?, ?, ?)",
+                    ("calls", "segments", "audits"),
+                )
+            except sqlite3.OperationalError:
+                pass
+            c.commit()
+    n_audio = _clear_playback_audio()
+    applog.event(
+        log, "cache_cleared",
+        calls=n_calls, segments=n_segments, audits=n_audits, audio=n_audio,
+    )
+    log.info(
+        "cache cleared: %d call(s), %d segment(s), %d scorecard(s), %d audio item(s)",
+        n_calls, n_segments, n_audits, n_audio,
+    )
+    return {
+        "status": "ok",
+        "deleted": {
+            "calls": n_calls,
+            "segments": n_segments,
+            "audits": n_audits,
+            "audio": n_audio,
+        },
+    }
 
 
 def _recap_export_fields(recap: dict | None) -> tuple[str, str, str]:
@@ -798,10 +833,247 @@ def _ratings_export_text(findings: list | None) -> str:
     return " | ".join(parts)
 
 
+_SCORECARD_DIM_ORDER = (
+    "resolution_effectiveness",
+    "ownership_next_steps",
+    "active_listening",
+    "tone_empathy_professionalism",
+)
+_AGENT_NAME_RE = re.compile(
+    r"\b(?:my name is|i am|i'm)\s+([a-z][a-z'`.-]{1,32}(?:\s+[a-z][a-z'`.-]{1,32})?)",
+    re.I,
+)
+_AGENT_NAME_STOP = {
+    "calling", "from", "with", "your", "the", "here", "today", "a", "an",
+    "sorry", "happy", "glad", "going", "looking", "checking", "trying",
+    "just", "so", "very", "really",
+}
+
+
+def _xml_text(value) -> str:
+    return xml_escape("" if value is None else str(value), {'"': "&quot;"})
+
+
+def _agent_display_name(audit: dict) -> str:
+    """Best-effort name from the agent's opening turns; else speaker label."""
+    speaker = audit.get("agent_speaker")
+    snippets = []
+    for s in audit.get("segments") or []:
+        if speaker and s.get("speaker") != speaker:
+            continue
+        snippets.append(s.get("text") or "")
+        if len(snippets) >= 12:
+            break
+    blob = " ".join(snippets)
+    m = _AGENT_NAME_RE.search(blob)
+    if m:
+        words = [
+            w for w in m.group(1).replace(".", " ").split()
+            if w.lower() not in _AGENT_NAME_STOP
+        ]
+        if words:
+            return " ".join(words).title()
+    return speaker or "Unknown"
+
+
+def _score_style_id(score) -> str:
+    try:
+        n = float(score)
+    except (TypeError, ValueError):
+        return "cell"
+    if n >= 80:
+        return "scoreGood"
+    if n >= 60:
+        return "scoreMid"
+    return "scoreLow"
+
+
+def _scorecard_dimension_columns(records: list[dict]) -> list[tuple[str, str]]:
+    """Return [(finding_id, header_label), ...] in rubric order, then extras."""
+    seen: dict[str, str] = {}
+    for rec in records:
+        for f in rec.get("findings") or []:
+            fid = f.get("id") or f.get("name")
+            if not fid:
+                continue
+            seen.setdefault(str(fid), f.get("name") or str(fid))
+    ordered = []
+    for fid in _SCORECARD_DIM_ORDER:
+        if fid in seen:
+            ordered.append((fid, seen.pop(fid)))
+    rest = sorted(seen.items(), key=lambda kv: kv[1].lower())
+    return ordered + rest
+
+
+def _scorecard_cell_xml(value, style="cell", number=False) -> str:
+    if value is None or value == "":
+        return f'<Cell ss:StyleID="{style}"/>'
+    if number:
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return (
+                f'<Cell ss:StyleID="{style}">'
+                f'<Data ss:Type="String">{_xml_text(value)}</Data></Cell>'
+            )
+        if num.is_integer():
+            shown = str(int(num))
+        else:
+            shown = str(num)
+        return (
+            f'<Cell ss:StyleID="{style}">'
+            f'<Data ss:Type="Number">{shown}</Data></Cell>'
+        )
+    return (
+        f'<Cell ss:StyleID="{style}">'
+        f'<Data ss:Type="String">{_xml_text(value)}</Data></Cell>'
+    )
+
+
+def _scorecard_xls(records: list[dict]) -> bytes:
+    """Excel XML Spreadsheet (opens in Excel/Sheets) with a colored Score column.
+
+    Plain CSV cannot store cell colors; this is the spreadsheet form of a CSV table.
+    """
+    dim_cols = _scorecard_dimension_columns(records)
+    headers = [
+        "Recording ID",
+        "Recording name",
+        "Agent name",
+        "Score",
+        "Grade",
+    ] + [label for _fid, label in dim_cols]
+
+    rows_xml = [
+        "<Row>"
+        + "".join(_scorecard_cell_xml(h, style="header") for h in headers)
+        + "</Row>"
+    ]
+    for rec in records:
+        by_id = {}
+        for f in rec.get("findings") or []:
+            fid = f.get("id") or f.get("name")
+            if fid:
+                by_id[str(fid)] = f
+        score = rec.get("score")
+        cells = [
+            _scorecard_cell_xml(rec.get("call_id"), number=True),
+            _scorecard_cell_xml(rec.get("filename")),
+            _scorecard_cell_xml(rec.get("agent_name")),
+            _scorecard_cell_xml(score, style=_score_style_id(score), number=True),
+            _scorecard_cell_xml(rec.get("grade")),
+        ]
+        for fid, _label in dim_cols:
+            f = by_id.get(fid) or {}
+            pts = f.get("points")
+            weight = f.get("weight")
+            if pts is not None and weight is not None:
+                cells.append(_scorecard_cell_xml(f"{pts}/{weight}"))
+            elif pts is not None:
+                cells.append(_scorecard_cell_xml(pts, number=True))
+            else:
+                cells.append(_scorecard_cell_xml(f.get("verdict")))
+        rows_xml.append("<Row>" + "".join(cells) + "</Row>")
+
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<?mso-application progid="Excel.Sheet"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
+ xmlns:o="urn:schemas-microsoft-com:office:office"
+ xmlns:x="urn:schemas-microsoft-com:office:excel"
+ xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+ <Styles>
+  <Style ss:ID="header">
+   <Font ss:Bold="1" ss:Color="#FFFFFF"/>
+   <Interior ss:Color="#1F2937" ss:Pattern="Solid"/>
+  </Style>
+  <Style ss:ID="cell"/>
+  <Style ss:ID="scoreGood">
+   <Font ss:Bold="1" ss:Color="#FFFFFF"/>
+   <Interior ss:Color="#16A34A" ss:Pattern="Solid"/>
+  </Style>
+  <Style ss:ID="scoreMid">
+   <Font ss:Bold="1" ss:Color="#FFFFFF"/>
+   <Interior ss:Color="#EA580C" ss:Pattern="Solid"/>
+  </Style>
+  <Style ss:ID="scoreLow">
+   <Font ss:Bold="1" ss:Color="#FFFFFF"/>
+   <Interior ss:Color="#DC2626" ss:Pattern="Solid"/>
+  </Style>
+ </Styles>
+ <Worksheet ss:Name="Scorecard">
+  <Table>
+   {"".join(rows_xml)}
+  </Table>
+ </Worksheet>
+</Workbook>
+"""
+    return xml.encode("utf-8")
+
+
+def _load_scorecard_records() -> list[dict]:
+    with _conn() as c:
+        rows = c.execute(
+            """
+            SELECT
+              c.id,
+              c.filename,
+              a.audit_json
+            FROM calls c
+            INNER JOIN audits a ON a.call_id = c.id
+            WHERE c.status = 'completed' OR c.status IS NULL OR c.status = ''
+            ORDER BY c.id ASC
+            """
+        ).fetchall()
+    records = []
+    for r in rows:
+        try:
+            audit = json.loads(r["audit_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(audit, dict):
+            continue
+        fname = (r["filename"] or "").strip() or f"call-{r['id']}.mp3"
+        records.append({
+            "call_id": r["id"],
+            "filename": fname,
+            "agent_name": _agent_display_name(audit),
+            "score": audit.get("score"),
+            "grade": audit.get("grade") or "",
+            "findings": audit.get("findings") or [],
+        })
+    return records
+
+
+@app.get("/api/calls/export-scorecard")
+def export_scorecard():
+    """Scorecard spreadsheet: recording id/name, agent, overall score (colored),
+    and each scoring area. Excel XML so the Score column can be green/orange/red
+    (plain CSV cannot store cell colors)."""
+    records = _load_scorecard_records()
+    if not records:
+        raise HTTPException(
+            status_code=404,
+            detail="No audited calls to export. Score a call first.",
+        )
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    body = _scorecard_xls(records)
+    applog.event(log, "scorecard_exported", count=len(records))
+    log.info("scorecard export %d audited call(s)", len(records))
+    return Response(
+        content=body,
+        media_type="application/vnd.ms-excel",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="callproof-scorecard-{stamp}.xls"'
+            ),
+        },
+    )
+
+
 @app.get("/api/calls/export")
 def export_calls(format: str = "csv"):
     """
-    One-click bulk export of score/grade, finding ratings, recap, and coaching.
+    One-click bulk export of score/grade, finding ratings, and recap.
     Omits raw transcripts. Defaults to CSV download; use format=json for JSON.
     """
     fmt = (format or "csv").strip().lower()
@@ -836,7 +1108,6 @@ def export_calls(format: str = "csv"):
             continue
 
         recap_tldr, recap_summary, recap_actions = _recap_export_fields(audit.get("recap"))
-        coaching = _coaching_export_text(audit)
         churn = audit.get("churn") or {}
         fname = (r["filename"] or "").strip() or f"call-{r['id']}.mp3"
         records.append({
@@ -853,7 +1124,6 @@ def export_calls(format: str = "csv"):
             "recap_tldr": recap_tldr,
             "recap_summary": recap_summary,
             "recap_actions": recap_actions,
-            "coaching": coaching,
         })
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -874,7 +1144,7 @@ def export_calls(format: str = "csv"):
     fields = [
         "filename", "call_id", "created_at", "audited_at", "audio_seconds",
         "score", "grade", "flagged", "churn_risk", "ratings",
-        "recap_tldr", "recap_summary", "recap_actions", "coaching",
+        "recap_tldr", "recap_summary", "recap_actions",
     ]
     writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
     writer.writeheader()
@@ -961,30 +1231,13 @@ def _ensure_retention_draft(call_id: int, audit: dict, rh: str) -> dict:
     return audit
 
 
-@app.post("/api/calls/{call_id}/coaching")
-def post_coaching(call_id: int):
-    """On-demand coaching tips (one Claude call) — not part of the audit hot path."""
-    audit, rh = _load_or_compute_audit(call_id, refresh=False)
-    weak = _weak_from_findings(audit.get("findings"))
-    if not weak:
-        log.info("coaching skipped for call %d — no weak findings", call_id)
-        audit["coaching"] = []
-        _save_audit(call_id, audit, rh)
-        return {"call_id": call_id, "coaching": []}
-
-    log.info("generating on-demand coaching for call %d (%d weak areas)", call_id, len(weak))
-    coaching = qa.generate_coaching(weak)
-    audit["coaching"] = coaching
-    _save_audit(call_id, audit, rh)
-    return {"call_id": call_id, "coaching": coaching}
-
-
 @app.post("/api/calls/{call_id}/feedback")
 def post_feedback(call_id: int):
-    """On-demand agent/product feedback (one Claude call). Cached after first success."""
+    """On-demand areas of improvement (Sonnet, effort=high). Cached after first success
+    that includes at least one agent insight."""
     audit, rh = _load_or_compute_audit(call_id, refresh=False)
     existing = audit.get("feedback") or {}
-    if existing.get("status") == "ok":
+    if existing.get("status") == "ok" and (existing.get("agent") or []):
         log.info("on-demand feedback cache HIT for call %d", call_id)
         applog.event(log, "feedback_cache", result="HIT", call_id=call_id)
         return {"call_id": call_id, "feedback": existing}
@@ -993,7 +1246,7 @@ def post_feedback(call_id: int):
     if not segments:
         audit["feedback"] = {
             "status": "error",
-            "error": "No transcript segments available for feedback.",
+            "error": "No transcript segments available for areas of improvement.",
             "agent": [],
             "product": [],
         }
@@ -1006,8 +1259,13 @@ def post_feedback(call_id: int):
 
     agent = audit.get("agent_speaker") or qa.classify_roles(segments)
     transcript_text = qa.format_transcript(segments, agent)
-    log.info("on-demand feedback for call %d", call_id)
-    feedback = qa.extract_feedback(transcript_text, segments)
+    log.info(
+        "on-demand areas of improvement for call %d (model=%s effort=%s)",
+        call_id, qa.MODEL, qa.CLAUDE_EFFORT,
+    )
+    feedback = qa.extract_feedback(
+        transcript_text, segments, findings=audit.get("findings"),
+    )
     audit["feedback"] = feedback
     _save_audit(call_id, audit, rh)
     applog.event(
@@ -1016,6 +1274,8 @@ def post_feedback(call_id: int):
         agent_items=len(feedback.get("agent") or []),
         product_items=len(feedback.get("product") or []),
         status=feedback.get("status"),
+        model="claude-sonnet-5",
+        effort="high",
     )
     return {"call_id": call_id, "feedback": feedback}
 
@@ -1372,7 +1632,7 @@ def upload_batch(file: UploadFile = File(...)):
                     "error": msg,
                 }
 
-        workers = min(MAX_BULK_FILES, max(1, len(extracted)))
+        workers = min(MAX_BULK_WORKERS, max(1, len(extracted)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = [pool.submit(ingest_one, item) for item in extracted]
             for fut in as_completed(futs):
@@ -1403,7 +1663,7 @@ def upload_batch(file: UploadFile = File(...)):
 
         audited = {}
         if to_audit:
-            with ThreadPoolExecutor(max_workers=min(MAX_BULK_FILES, len(to_audit))) as pool:
+            with ThreadPoolExecutor(max_workers=min(MAX_BULK_WORKERS, len(to_audit))) as pool:
                 futs = [pool.submit(audit_one, row) for row in to_audit]
                 for fut in as_completed(futs):
                     row = fut.result()

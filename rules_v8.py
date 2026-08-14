@@ -36,13 +36,30 @@ def _fold_speech(text):
     return re.sub(r"\s+", " ", t).strip()
 
 
+_SHORT_WORD = re.compile(r"^[a-z']+$")
+
+
+def _term_start(folded_text, term):
+    """Index of term in folded text, or -1.
+
+    Single words (sorry, miss, please) use word boundaries so 'miss' does not
+    match 'dismiss' / 'missing'. Multi-word phrases stay substring matches.
+    """
+    if not term:
+        return -1
+    if " " not in term and _SHORT_WORD.fullmatch(term):
+        m = re.search(r"\b" + re.escape(term) + r"\b", folded_text)
+        return m.start() if m else -1
+    return folded_text.find(term)
+
+
 def find_term(text, terms):
     """Negation-aware match. Use for commitment/ownership-style phrases where
     negation genuinely changes the meaning ("I won't be able to personally
     handle this" should not match "i will personally")."""
     t = _fold_speech(text)
     for term in sorted((terms or []), key=len, reverse=True):
-        idx = t.find(term)
+        idx = _term_start(t, term)
         if idx == -1:
             continue
         window = t[idx: idx + len(term) + NEGATION_LOOKAHEAD_CHARS]
@@ -53,12 +70,18 @@ def find_term(text, terms):
 
 
 def find_term_plain(text, terms):
-    """Plain substring match, NO negation exemption. Use for hostile/profane
+    """Word-boundary match, NO negation exemption. Use for hostile/profane
     language, where negation doesn't neutralize the behavior the way it
-    neutralizes a commitment phrase."""
+    neutralizes a commitment phrase.
+
+    Word boundaries keep short terms like 'ass' from matching 'class' / 'pass'.
+    Longer phrases ('piece of shit') still match as a whole.
+    """
     t = _fold_speech(text)
     for term in sorted((terms or []), key=len, reverse=True):
-        if term in t:
+        if not term:
+            continue
+        if re.search(r"\b" + re.escape(term) + r"\b", t):
             return term
     return None
 
@@ -780,10 +803,13 @@ HOSTILE_PHRASES = [
 ]
 
 PROFANITY_TERMS = [
-    "fuck", "fucking", "fuck you", "fuck off", "shit", "shitty",
-    "bullshit", "screw you", "screw this", "piss off",
-    "asshole", "damn it", "goddamn", "hell with you",
-    "to hell with you", "shut up", "bastard", "idiot", "stupid",
+    "fuck", "fucking", "fuck you", "fuck off", "motherfucker",
+    "shit", "shitty", "bullshit", "piece of shit",
+    "screw you", "screw this", "piss off",
+    "asshole", "dumbass", "jackass", "bitchass", "ass", "arse",
+    "bitch", "cunt", "cock", "cocksucker", "dick", "tits", "boobs", "pussy",
+    "damn it", "goddamn", "hell with you", "to hell with you",
+    "shut up", "bastard", "idiot", "stupid", "retard", "faggot",
 ]
 
 EMPATHY_PHRASES = [
@@ -810,6 +836,9 @@ EMPATHY_PHRASES = [
     "no worries", "no problem", "not a problem", "not a problem at all",
     "that's frustrating", "i know it's frustrating",
     "appreciate",
+    "i would do the same if i were in your position",
+    "i totally get it", "totally get it",
+    "sincere apologies", "grateful", "understand", "sorry",
 ]
 
 EMPATHY_RE = re.compile(
@@ -841,6 +870,9 @@ PROFESSIONAL_PHRASES = [
     "have a great day", "have a good day", "have a nice day",
     "you're welcome", "you are welcome", "most welcome",
     "please stay on the line", "thank you", "thanks for your",
+    "to be perfectly candid", "allow me to explain", "let me know if",
+    "please understand that", "reiterating", "please",
+    "sir", "madam", "miss", "sire", "allow me some time",
 ]
 
 PROFESSIONAL_RE = re.compile(
@@ -868,6 +900,9 @@ WILLINGNESS_PHRASES = [
     "i'll get those details", "i will get those details",
     "checking this", "i'm checking this", "i am checking this",
     "leave it with me",
+    "checking", "i'll check", "i will check", "let me check",
+    "allow me some time to check", "let me know if this helped",
+    "please let me know", "helps", "works",
 ]
 
 CUSTOMER_HELPED_PHRASES = [
@@ -1109,7 +1144,7 @@ def score_tone_categories(segments, agent_speaker, resolution_passed=False):
 
 
 def check_hostile_step1(segments, agent_speaker):
-    """Plain match, deliberately not negation-aware -- see find_term_plain."""
+    """Word-boundary match, deliberately not negation-aware -- see find_term_plain."""
     scored = score_tone_categories(segments, agent_speaker)
     if scored["hostile_override"]:
         return _result(

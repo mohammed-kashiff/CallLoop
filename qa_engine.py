@@ -48,7 +48,7 @@ CLAUDE_EFFORT = "high"
 # hybrid: channel/greeting roles; Claude for resolution + churn (parallel).
 #         Tone LLM, ownership step-2, and first-load feedback stay skipped.
 # full: same roles, plus tone LLM, ownership step-2 LLM, churn.
-# Feedback is on-demand (Get feedback), not part of the first-load wave.
+# Feedback is on-demand (Areas of Improvement), not part of the first-load wave.
 _raw_mode = (os.getenv("AUDIT_MODE") or "hybrid").strip().lower()
 AUDIT_MODE = _raw_mode if _raw_mode in ("hybrid", "full") else "hybrid"
 if _raw_mode not in ("hybrid", "full"):
@@ -325,20 +325,21 @@ def build_prompt(question, transcript_text, allowed_verdicts, strict=False):
     return base
 
 
-def _claude_json_body(prompt: str) -> dict:
+def _claude_json_body(prompt: str, model=None, effort=None, max_tokens=None) -> dict:
     """Sonnet 5+ accepts output_config.effort. Haiku 4.5 rejects it."""
+    model = model or MODEL
     body = {
-        "model": MODEL,
-        "max_tokens": MAX_TOKENS,
+        "model": model,
+        "max_tokens": max_tokens or MAX_TOKENS,
         "messages": [{"role": "user", "content": prompt}],
     }
-    if "haiku" not in (MODEL or "").lower():
+    if "haiku" not in (model or "").lower():
         body["thinking"] = {"type": "disabled"}
-        body["output_config"] = {"effort": CLAUDE_EFFORT}
+        body["output_config"] = {"effort": effort or CLAUDE_EFFORT}
     return body
 
 
-def call_claude(prompt):
+def call_claude(prompt, model=None, effort=None, max_tokens=None, timeout=60):
     """POST to Claude with temperature=0. Retries with backoff on 429/5xx.
     Logs every failed attempt. Raises RuntimeError only if all attempts fail."""
     if not ANTHROPIC_API_KEY:
@@ -357,8 +358,10 @@ def call_claude(prompt):
                 headers={"x-api-key": ANTHROPIC_API_KEY,
                          "anthropic-version": "2023-06-01",
                          "content-type": "application/json"},
-                json=_claude_json_body(prompt),
-                timeout=60,
+                json=_claude_json_body(
+                    prompt, model=model, effort=effort, max_tokens=max_tokens,
+                ),
+                timeout=timeout,
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -576,7 +579,7 @@ def draft_retention_email(transcript_text, segments):
 def run_parallel_claude_wave(criteria, segments, agent_speaker, transcript_text, max_workers=None, rubric=None):
     """
     Fire independent Claude work in one parallel wave (dimensions/criteria +
-    churn). Retention email, coaching tips, and customer feedback are on-demand.
+    churn). Retention email and areas of improvement are on-demand.
     Hybrid mode: Claude for resolution + churn (parallel); skip tone/ownership step-2.
     """
     mode = audit_mode()
@@ -690,62 +693,124 @@ def score_results(results):
     return rows, score, round(earned, 1), round(possible, 1), tally, gate_fails
 
 
-# ---------- Coaching ----------
-def generate_coaching(weak):
-    lines = []
-    for i, (c, res) in enumerate(weak, 1):
-        ev = res.get("evidence_text") or "(no specific line)"
-        lines.append(f'{i}. {c["name"]} ({res["verdict"].upper()}): {res["reasoning"]} Evidence: "{ev}"')
-    prompt = (
-        "You are a supportive but candid call-coaching assistant. Below are the criteria where "
-        "the agent scored below full marks. For EACH area, write ONE specific, actionable coaching "
-        "tip (1-2 sentences) referencing what actually happened. Return ONLY this JSON:\n"
-        '{"coaching": [{"criterion": "<exact criterion name>", "tip": "<1-2 sentences>"}]}\n\n'
-        "WEAK AREAS:\n" + "\n".join(lines)
-    )
-    for attempt in range(2):
-        try:
-            out = parse_json(call_claude(prompt)).get("coaching", [])
-            log.info("coaching generated for %d area(s)", len(weak))
-            return out
-        except Exception as e:  # noqa: BLE001
-            log.error("coaching attempt %d failed: %s", attempt + 1, e)
-    return [{"criterion": c["name"], "tip": "(coaching temporarily unavailable)"} for c, _ in weak]
+def _feedback_item(summary, sentiment, quote, seq, verified):
+    return {
+        "summary": summary or "",
+        "sentiment": sentiment if sentiment in ("positive", "negative", "neutral") else "neutral",
+        "quote": quote or None,
+        "seq": seq if verified else None,
+        "verified": verified if quote else None,
+    }
 
 
-def extract_feedback(transcript_text, segments):
-    """Extract customer feedback, split into feedback about the AGENT/service and about the
-    PRODUCT. Each quote is evidence-validated against the transcript."""
+def _parse_feedback_bucket(raw_items, segments):
+    items = []
+    for it in raw_items or []:
+        if not isinstance(it, dict):
+            continue
+        quote = (it.get("quote") or "")
+        verified, seq = validate_evidence(quote, segments) if quote else (False, None)
+        summary = (it.get("summary") or "").strip()
+        if not summary and not quote:
+            continue
+        items.append(_feedback_item(
+            summary, it.get("sentiment", "neutral"), quote, seq, verified,
+        ))
+    return items
+
+
+def _agent_insights_from_findings(findings, segments):
+    """Guarantee the agent box is never empty: use scored gaps, else a pass note."""
+    items = []
+    for f in findings or []:
+        if not isinstance(f, dict):
+            continue
+        if (f.get("verdict") or "") not in ("partial", "fail"):
+            continue
+        quote = f.get("evidence_text") or ""
+        seq = f.get("evidence_seq")
+        verified = False
+        if quote:
+            verified, found = validate_evidence(quote, segments)
+            if verified:
+                seq = found
+        why = (f.get("why") or f.get("reasoning") or "").strip()
+        name = f.get("name") or f.get("id") or "this dimension"
+        summary = why or f"Improve {name}: the agent did not fully meet this dimension."
+        items.append(_feedback_item(
+            summary,
+            "negative" if f.get("verdict") == "fail" else "neutral",
+            quote, seq, verified,
+        ))
+        if len(items) >= 3:
+            break
+    if items:
+        return items
+    return [_feedback_item(
+        "No major agent gaps stood out on this call. Keep the listening, ownership, "
+        "and tone behaviors that scored a pass.",
+        "positive", None, None, None,
+    )]
+
+
+def extract_feedback(transcript_text, segments, findings=None):
+    """Areas of improvement: agent insights (always) + product comments (if any).
+
+    Uses Claude Sonnet at effort=high. Agent bucket is required even when the
+    customer never commented on the agent — infer from the agent's turns.
+    """
     prompt = (
-        "Extract any FEEDBACK the CUSTOMER gave during this call, sorted into two buckets:\n"
-        "- 'agent': feedback about the agent or the service experience (helpfulness, treatment, "
-        "wait time, how the issue was handled).\n"
-        "- 'product': feedback about the product or offering itself (features, pricing, "
-        "reliability, bugs, what they wish it did).\n"
-        "Only include things the CUSTOMER actually said. Empty bucket = empty list.\n\n"
+        "You are a call-quality coach writing AREAS OF IMPROVEMENT for this call.\n\n"
+        "Fill two buckets:\n"
+        "- 'agent' (REQUIRED, 1 to 3 items): concrete insights about how the AGENT handled "
+        "the call — listening, ownership, tone, resolution, next steps. Do NOT leave this "
+        "empty. Prefer what the customer reacted to. If the customer never commented on the "
+        "agent, infer from the agent's own turns. Each summary is 1-2 sentences of coaching "
+        "insight, not a restatement of the quote.\n"
+        "- 'product' (0 or more): only what the CUSTOMER said about the product, pricing, "
+        "features, reliability, or bugs. Empty list is OK.\n\n"
+        "Quotes must be copied verbatim from one transcript line. For an inferred agent "
+        "insight, quote the AGENT line the insight refers to. Never invent a quote.\n\n"
         f"TRANSCRIPT (one turn per line):\n{transcript_text}\n\n"
-        'Return ONLY this JSON:\n'
-        '{"agent": [{"summary":"short paraphrase","sentiment":"positive|negative|neutral",'
-        '"quote":"exact customer line","seq":<seq or null>}], "product":[ ...same shape... ]}'
+        "Return ONLY this JSON:\n"
+        '{"agent": [{"summary":"1-2 sentence insight","sentiment":"positive|negative|neutral",'
+        '"quote":"exact transcript span","seq":<seq or null>}], "product":[ ...same shape... ]}'
     )
+    model = "claude-sonnet-5"
+    effort = "high"
     try:
-        parsed = parse_json(call_claude(prompt))
+        parsed = parse_json(call_claude(
+            prompt,
+            model=model,
+            effort=effort,
+            max_tokens=3000,
+            timeout=90,
+        ))
     except Exception as e:  # noqa: BLE001
         log.error("feedback extraction failed: %s", e)
-        return {"status": "error", "error": str(e), "agent": [], "product": []}
-    out = {}
-    for bucket in ("agent", "product"):
-        items = []
-        for it in (parsed.get(bucket) or []):
-            quote = (it.get("quote") or "")
-            verified, seq = validate_evidence(quote, segments) if quote else (False, None)
-            items.append({"summary": it.get("summary", ""),
-                          "sentiment": it.get("sentiment", "neutral"),
-                          "quote": quote or None,
-                          "seq": seq if verified else None,
-                          "verified": verified if quote else None})
-        out[bucket] = items
-    log.info("feedback extracted: %d agent, %d product", len(out["agent"]), len(out["product"]))
+        agent = _agent_insights_from_findings(findings, segments)
+        return {
+            "status": "ok",
+            "agent": agent,
+            "product": [],
+            "source": "findings_fallback",
+        }
+    out = {
+        "agent": _parse_feedback_bucket(parsed.get("agent"), segments),
+        "product": _parse_feedback_bucket(parsed.get("product"), segments),
+    }
+    if not out["agent"]:
+        out["agent"] = _agent_insights_from_findings(findings, segments)
+    applog.event(
+        log, "feedback_model",
+        model=model, effort=effort,
+        agent_items=len(out["agent"]),
+        product_items=len(out["product"]),
+    )
+    log.info(
+        "areas of improvement via %s effort=%s: %d agent, %d product",
+        model, effort, len(out["agent"]), len(out["product"]),
+    )
     out["status"] = "ok"
     return out
 

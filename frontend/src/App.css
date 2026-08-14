@@ -369,7 +369,8 @@ button {
 .library-refresh,
 .lib-open,
 .bulk-job-view,
-.coach-btn {
+.coach-btn,
+.cache-clear {
   border: 1px solid var(--line-strong);
   background: var(--surface);
   border-radius: var(--radius-sm);
@@ -390,7 +391,8 @@ button {
 .library-refresh:disabled,
 .lib-open:disabled,
 .bulk-job-view:disabled,
-.coach-btn:disabled {
+.coach-btn:disabled,
+.cache-clear:disabled {
   opacity: 0.45;
   cursor: default;
 }
@@ -402,6 +404,16 @@ button {
 .bulk-job-view:hover:not(:disabled) {
   background: var(--surface-2);
   border-color: rgba(255, 255, 255, 0.2);
+}
+
+.cache-clear {
+  color: #fca5a5;
+  border-color: rgba(220, 38, 38, 0.4);
+}
+
+.cache-clear:hover:not(:disabled) {
+  background: var(--red-soft);
+  border-color: rgba(220, 38, 38, 0.55);
 }
 
 /* ---------- Library ---------- */
@@ -420,6 +432,12 @@ button {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 12px;
+}
+
+.calls-library-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .calls-library-title {
@@ -1265,48 +1283,11 @@ button {
 
 .jump:hover { background: #188a49; }
 
-/* ---------- Coaching ---------- */
-
-.coaching-block .h {
-  margin-top: 0;
-  border-top: none;
-  padding-top: 0;
-}
-
-.coaching-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin: 22px 0 10px;
-  border-top: 1px solid var(--line);
-  padding-top: 16px;
-}
-
 .coach-empty {
   font-size: 13.5px;
   color: var(--muted);
   line-height: 1.45;
   margin: 0 0 8px;
-}
-
-.coach {
-  border-left: 2px solid var(--green);
-  padding: 2px 0 2px 12px;
-  margin-bottom: 12px;
-}
-
-.coach-crit {
-  font-weight: 650;
-  font-size: 12.5px;
-  color: var(--green-ink);
-  margin-bottom: 3px;
-}
-
-.coach-tip {
-  font-size: 13.5px;
-  line-height: 1.5;
-  color: var(--text-soft);
 }
 
 /* ---------- Feedback ---------- */

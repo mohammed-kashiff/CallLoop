@@ -372,7 +372,7 @@ def run_v8_wave(rubric, segments, agent_speaker, transcript_text,
             else:
                 churn = fut.result()
 
-    # Agent/product feedback is on-demand (Get feedback button), not first load.
+    # Agent/product areas of improvement are on-demand (button), not first load.
     feedback = {
         "status": "skipped",
         "reason": "on_demand",
@@ -454,7 +454,7 @@ def run_v8_wave(rubric, segments, agent_speaker, transcript_text,
         "v8 wave done in %.1fs (%d dims) mode=%s score=%s band=%s hostile=%s review=%s",
         time.perf_counter() - t0, n, audit_mode, score, grade, hostile, len(manager_review),
     )
-    # Retention email, coaching tips, and customer feedback are on-demand (not in this wave).
+    # Retention email and areas of improvement are on-demand (not in this wave).
     return ordered, churn, feedback, None, score, tally, grade, hostile, manager_review
 
 

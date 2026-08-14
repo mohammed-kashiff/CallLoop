@@ -6,7 +6,7 @@ import "./App.css";
 const API = "http://localhost:8000";
 const MAX_UPLOAD_MB = 25;
 const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
-const MAX_BULK_FILES = 20;
+const MAX_BULK_FILES = 100;
 const FRACTION = { pass: 1, partial: 0.5, fail: 0, unverified: 0, error: 0 };
 
 function fmtTime(s) {
@@ -173,11 +173,11 @@ export default function App() {
   const [dragOver, setDragOver] = useState(false);
   const [emailStatus, setEmailStatus] = useState(null); // null | opening | opened | error
   const [emailMessage, setEmailMessage] = useState(null);
-  const [coachingLoading, setCoachingLoading] = useState(false);
-  const [coachingError, setCoachingError] = useState(null);
   const [feedbackLoading, setFeedbackLoading] = useState(false);
   const [feedbackError, setFeedbackError] = useState(null);
   const [showLibrary, setShowLibrary] = useState(false);
+  const [cacheClearing, setCacheClearing] = useState(false);
+  const [exportingScorecard, setExportingScorecard] = useState(false);
   const [manualReviewFlagged, setManualReviewFlagged] = useState(false);
   const [manualReviewMessage, setManualReviewMessage] = useState(null);
   const [pyaiStatus, setPyaiStatus] = useState(null);
@@ -274,8 +274,6 @@ export default function App() {
     setError(null);
     setEmailStatus(null);
     setEmailMessage(null);
-    setCoachingError(null);
-    setCoachingLoading(false);
     setFeedbackError(null);
     setFeedbackLoading(false);
     setManualReviewFlagged(false);
@@ -550,29 +548,83 @@ export default function App() {
     if (!bulkRunning && !uploading) handleFiles(e.dataTransfer.files);
   }
 
-  async function loadCoaching() {
-    if (callId == null || coachingLoading) return;
-    setCoachingLoading(true);
-    setCoachingError(null);
+  async function clearCache() {
+    if (cacheClearing || uploading || loading || pipelineActive || bulkRunning) return;
+    const ok = window.confirm(
+      "Clear cache? This deletes all stored transcripts, scorecards, and playback audio. You will need to upload recordings again.",
+    );
+    if (!ok) return;
+    setCacheClearing(true);
+    setError(null);
+    setUploadError(null);
     try {
-      const r = await fetch(`${API}/api/calls/${callId}/coaching`, { method: "POST" });
+      const r = await fetch(`${API}/api/cache/clear`, { method: "POST" });
       if (!r.ok) {
         const d = await r.json().catch(() => ({}));
-        const detail = typeof d.detail === "string" ? d.detail : "Could not generate coaching.";
+        const detail = typeof d.detail === "string" ? d.detail : "Could not clear cache.";
         throw new Error(detail);
       }
-      const data = await r.json();
-      setAudit((prev) => (prev ? { ...prev, coaching: data.coaching || [] } : prev));
+      const a = audioRef.current;
+      if (a) {
+        a.pause();
+        a.removeAttribute("src");
+        a.load();
+      }
+      setCalls([]);
+      setCallId(null);
+      setAudit(null);
+      setBulkJobs([]);
+      setBulkNote(null);
+      setFeedbackError(null);
+      setEmailStatus(null);
+      setEmailMessage(null);
+      setManualReviewFlagged(false);
+      setManualReviewMessage(null);
     } catch (e) {
-      setCoachingError(e.message || "Could not generate coaching.");
+      setError(e.message || "Could not clear cache.");
     } finally {
-      setCoachingLoading(false);
+      setCacheClearing(false);
+    }
+  }
+
+  async function exportScorecard() {
+    if (exportingScorecard || uploading || loading || pipelineActive || bulkRunning) {
+      return;
+    }
+    setExportingScorecard(true);
+    setError(null);
+    try {
+      const r = await fetch(`${API}/api/calls/export-scorecard`);
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        const detail =
+          typeof d.detail === "string" ? d.detail : "Could not export scorecard.";
+        throw new Error(detail);
+      }
+      const blob = await r.blob();
+      let name = "callproof-scorecard.xls";
+      const cd = r.headers.get("Content-Disposition") || "";
+      const m = /filename="([^"]+)"/.exec(cd);
+      if (m) name = m[1];
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(e.message || "Could not export scorecard.");
+    } finally {
+      setExportingScorecard(false);
     }
   }
 
   async function loadFeedback() {
     if (callId == null || feedbackLoading) return;
-    if ((audit?.feedback || {}).status === "ok") return;
+    if ((audit?.feedback || {}).status === "ok"
+        && (audit?.feedback?.agent || []).length > 0) return;
     const id = callId;
     setFeedbackLoading(true);
     setFeedbackError(null);
@@ -662,9 +714,9 @@ export default function App() {
   const feedback = audit?.feedback ?? null;
   const feedbackStatus = feedback?.status ?? "skipped";
   const feedbackReady = feedbackStatus === "ok";
-  const showFeedbackButton = !feedbackReady;
   const agentFeedback = feedback?.agent ?? [];
   const productFeedback = feedback?.product ?? [];
+  const showFeedbackButton = !feedbackReady || agentFeedback.length === 0;
 
   const callRecap = audit?.recap ?? null;
   const recapStatus = callRecap?.status ?? null;
@@ -672,13 +724,8 @@ export default function App() {
   const retentionEmail = audit?.retention_email ?? null;
   const retentionReady = retentionEmail?.status === "ok" && !!retentionEmail?.body;
 
-  const coaching = audit?.coaching ?? [];
-  const weakCount =
-    audit?.findings?.filter((f) =>
-      ["fail", "partial", "unverified"].includes(f.verdict),
-    ).length ?? 0;
-
   const jobActive = uploading || loading || pipelineActive || bulkRunning;
+  const hasAuditedCalls = calls.some((c) => c.has_audit);
   const jobPhase = uploading
     ? "transcribe"
     : loading || pipelineActive
@@ -914,41 +961,9 @@ export default function App() {
               );
             })}
 
-            <section className="coaching-block">
-              <div className="coaching-head">
-                <h2 className="h">Coaching</h2>
-                {weakCount > 0 && (
-                  <button
-                    className="coach-btn"
-                    onClick={loadCoaching}
-                    disabled={coachingLoading}
-                  >
-                    {coachingLoading
-                      ? "Generating…"
-                      : coaching.length > 0
-                        ? "Refresh tips"
-                        : "Get tips"}
-                  </button>
-                )}
-              </div>
-              {coachingError && <div className="banner error">{coachingError}</div>}
-              {weakCount === 0 ? (
-                <p className="coach-empty">Nothing to coach — all dimensions passed.</p>
-              ) : coaching.length === 0 && !coachingLoading ? (
-                <p className="coach-empty">Optional — runs one Claude call when you ask.</p>
-              ) : (
-                coaching.map((c, i) => (
-                  <div className="coach" key={i}>
-                    <div className="coach-crit">{c.criterion}</div>
-                    <div className="coach-tip">{c.tip}</div>
-                  </div>
-                ))
-              )}
-            </section>
-
             <section className="customer-feedback">
               <div className="feedback-head">
-                <h2 className="h">Feedback</h2>
+                <h2 className="h">Areas of Improvement</h2>
                 {showFeedbackButton && (
                   <button
                     type="button"
@@ -956,25 +971,25 @@ export default function App() {
                     onClick={loadFeedback}
                     disabled={feedbackLoading}
                   >
-                    {feedbackLoading ? "Getting…" : "Get feedback"}
+                    {feedbackLoading ? "Getting…" : "Areas of Improvement"}
                   </button>
                 )}
               </div>
               {feedbackError && <div className="banner error">{feedbackError}</div>}
               {feedbackStatus === "error" ? (
                 <div className="banner error">
-                  Customer feedback could not be assessed for this call.
+                  Areas of improvement could not be assessed for this call.
                 </div>
               ) : !feedbackReady ? (
                 <p className="coach-empty">
                   {feedbackLoading
-                    ? "Reading the transcript for customer feedback…"
-                    : "Optional — runs one Claude call when you ask."}
+                    ? "Reading the transcript for areas of improvement…"
+                    : "Optional — runs one Claude Sonnet call when you ask."}
                 </p>
               ) : (
                   <div className="fb-grid">
                     <div className="fb-group">
-                      <h3 className="fb-group-title">Feedback for agent</h3>
+                      <h3 className="fb-group-title">Agent</h3>
                       {agentFeedback.length > 0 ? (
                         agentFeedback.map((it, i) => {
                           const seg = it.seq != null ? segBySeq[it.seq] : null;
@@ -1004,7 +1019,7 @@ export default function App() {
                     </div>
 
                     <div className="fb-group">
-                      <h3 className="fb-group-title">Feedback for product</h3>
+                      <h3 className="fb-group-title">Product</h3>
                       {productFeedback.length > 0 ? (
                         productFeedback.map((it, i) => {
                           const seg = it.seq != null ? segBySeq[it.seq] : null;
@@ -1118,6 +1133,23 @@ export default function App() {
           >
             {showLibrary ? "Hide calls" : "All calls"}
           </button>
+          <button
+            type="button"
+            className="cache-clear"
+            onClick={clearCache}
+            disabled={jobActive || cacheClearing}
+          >
+            {cacheClearing ? "Clearing…" : "Clear cache"}
+          </button>
+          <button
+            type="button"
+            className="library-toggle"
+            onClick={exportScorecard}
+            disabled={jobActive || exportingScorecard || !hasAuditedCalls}
+            title="Excel spreadsheet — Score column is green / orange / red"
+          >
+            {exportingScorecard ? "Exporting…" : "Export scorecard"}
+          </button>
           {calls.filter((c) => c.status === "completed" || !c.status).length > 0 && (
             <label className="call-select-wrap">
               <span className="call-select-label">Call</span>
@@ -1159,6 +1191,7 @@ export default function App() {
                 {calls.length} call{calls.length === 1 ? "" : "s"} saved
               </p>
             </div>
+            <div className="calls-library-actions">
             <button
               type="button"
               className="library-refresh"
@@ -1167,6 +1200,16 @@ export default function App() {
             >
               Refresh
             </button>
+            <button
+              type="button"
+              className="library-refresh"
+              disabled={jobActive || exportingScorecard || !hasAuditedCalls}
+              onClick={exportScorecard}
+              title="Excel spreadsheet — Score column is green / orange / red"
+            >
+              {exportingScorecard ? "Exporting…" : "Export scorecard"}
+            </button>
+            </div>
           </div>
           {calls.length === 0 ? (
             <p className="calls-library-empty">No calls stored yet. Upload a recording to begin.</p>
