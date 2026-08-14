@@ -39,20 +39,14 @@ export function ProblemSection() {
   return (
     <section ref={ref} className="problem-section" aria-labelledby="problem-heading">
       <div className="problem-intro">
-        <div>
-          <p className="problem-kicker reveal">The problem</p>
-          <h2 id="problem-heading" className="problem-title reveal">
-            The score ends where the impact should begin.
-          </h2>
-          <p className="problem-lede reveal">
-            Most QA tools grade a call and stop. What happens next — coaching that lands, a fix that ships, a
-            churn signal that reaches someone in time — is left to chance.
-          </p>
-        </div>
-        <aside className="problem-free reveal" aria-label="Pricing">
-          <p className="problem-free-label">Free</p>
-          <p className="problem-free-fine">You pay just for what you actually use</p>
-        </aside>
+        <p className="problem-kicker reveal">The problem</p>
+        <h2 id="problem-heading" className="problem-title reveal">
+          The score ends where the impact should begin.
+        </h2>
+        <p className="problem-lede reveal">
+          Most QA tools grade a call and stop. What happens next — coaching that lands, a fix that ships, a
+          churn signal that reaches someone in time — is left to chance.
+        </p>
       </div>
 
       <div className="problem-grid">
