@@ -1,36 +1,8 @@
-import { useEffect, useState } from 'react'
-import { API, fmtUsd } from '../lib/api'
-import type { PyaiStatus } from '../types'
+import { fmtUsd } from '../lib/api'
+import { usePyaiStatus } from '../context/PyaiStatus'
 
 export function LiveTicker() {
-  const [status, setStatus] = useState<PyaiStatus | null>(null)
-
-  useEffect(() => {
-    let cancelled = false
-    const load = () => {
-      fetch(`${API}/api/pyai/status`)
-        .then((r) => r.json() as Promise<PyaiStatus>)
-        .then((data) => {
-          if (!cancelled) setStatus(data)
-        })
-        .catch(() => {
-          if (!cancelled) {
-            setStatus({
-              ok: false,
-              healthy: false,
-              label: 'PyAI',
-              quota_label: 'Status unavailable',
-            })
-          }
-        })
-    }
-    load()
-    const id = window.setInterval(load, 15000)
-    return () => {
-      cancelled = true
-      window.clearInterval(id)
-    }
-  }, [])
+  const { status, label } = usePyaiStatus()
 
   const stats =
     status?.quota_label ||
@@ -44,13 +16,13 @@ export function LiveTicker() {
     'Waiting…'
 
   return (
-    <div className="live-ticker" aria-label="Live usage">
+    <div className="live-ticker" aria-label="PyAI usage">
       <span className="live-pill">
         <span
           className={['live-dot', status?.healthy ? 'is-ok' : ''].filter(Boolean).join(' ')}
           aria-hidden="true"
         />
-        <strong>{(status?.label || 'LIVE').toUpperCase()}</strong>
+        <strong>{label.toUpperCase()}</strong>
         <span className="live-stats">{stats}</span>
       </span>
       {status?.cost_today && (

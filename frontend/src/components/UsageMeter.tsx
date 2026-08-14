@@ -1,21 +1,47 @@
+import { usePyaiStatus } from '../context/PyaiStatus'
+
 export function UsageMeter() {
+  const { status, isSandbox, label } = usePyaiStatus()
+  const title = label || 'PyAI'
+  const missing =
+    !status ||
+    title.toLowerCase() === 'no key' ||
+    title.toLowerCase() === 'pyai' ||
+    title === '…'
+  const tone = isSandbox ? 'sandbox' : missing ? 'pending' : 'live'
+
   return (
-    <section className="usage-meter is-sandbox" aria-label="Sandbox">
-      <p className="usage-kicker">Sandbox</p>
-      <div className="usage-unlimited">
-        <span className="usage-infinity" aria-hidden="true">
-          <svg viewBox="0 0 24 24">
-            <path
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.8"
-              strokeLinecap="round"
-              d="M4.8 12c0-2.4 1.9-4.3 4.3-4.3 1.9 0 3.1 1.2 4.9 3.3 1.8-2.1 3-3.3 4.9-3.3 2.4 0 4.3 1.9 4.3 4.3s-1.9 4.3-4.3 4.3c-1.9 0-3.1-1.2-4.9-3.3-1.8 2.1-3 3.3-4.9 3.3-2.4 0-4.3-1.9-4.3-4.3Z"
-            />
-          </svg>
-        </span>
-        <span>Unlimited</span>
-      </div>
+    <section
+      className={['usage-meter', `is-${tone}`].join(' ')}
+      aria-label={title}
+    >
+      <p className="usage-kicker">{title}</p>
+      {isSandbox ? (
+        <div className="usage-unlimited">
+          <span className="usage-infinity" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                d="M4.8 12c0-2.4 1.9-4.3 4.3-4.3 1.9 0 3.1 1.2 4.9 3.3 1.8-2.1 3-3.3 4.9-3.3 2.4 0 4.3 1.9 4.3 4.3s-1.9 4.3-4.3 4.3c-1.9 0-3.1-1.2-4.9-3.3-1.8 2.1-3 3.3-4.9 3.3-2.4 0-4.3-1.9-4.3-4.3Z"
+              />
+            </svg>
+          </span>
+          <span>Unlimited</span>
+        </div>
+      ) : (
+        <div className="usage-live-copy">
+          <span>
+            {missing
+              ? title === '…'
+                ? 'Checking…'
+                : 'Add a PyAI key'
+              : 'Billed usage'}
+          </span>
+        </div>
+      )}
     </section>
   )
 }
