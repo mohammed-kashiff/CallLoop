@@ -22,7 +22,6 @@ import logging
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import httpx
 from dotenv import load_dotenv
 
 import rules
